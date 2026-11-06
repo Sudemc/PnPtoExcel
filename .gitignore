@@ -1,0 +1,29 @@
+# Virtual environment & Python cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+src/*.egg-info/
+.pytest_cache/
+
+# OS & temporary files
+Thumbs.db
+.DS_Store
+~$*.xlsx
+test_*.xlsx
+test_*.AOI
+
+# Customer sample files & archives (kept local only)
+*.zip
+*.rar
+*.xlsx
+*.csv
+*.AOI
+*.GBR
+*.jpeg
+*.pdf
+Pick Place*
+2026-10-14*
+VAL8_V2_UC2_V8.1/

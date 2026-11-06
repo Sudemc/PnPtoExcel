@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SMT Pick & Place to Excel / AOI & Canias BOM Doğrulama</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --primary: #0f766e;
+      --primary-hover: #0d5f58;
+      --primary-light: #ccfbf1;
+      --secondary: #1e293b;
+      --accent: #2563eb;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --error-bg: #fee2e2;
+      --error-text: #b91c1c;
+      --warning-bg: #fef3c7;
+      --warning-text: #b45309;
+      --success-bg: #dcfce7;
+      --success-text: #15803d;
+      --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+      --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+      --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh; display: flex; flex-direction: column; }
+
+    header {
+      background: linear-gradient(135deg, #1e293b 0%, #0f766e 100%);
+      color: white;
+      padding: 1.5rem 2rem;
+      box-shadow: var(--shadow);
+    }
+    .header-container { max-width: 1300px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
+    .brand h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: center; gap: 0.6rem; }
+    .brand p { font-size: 0.85rem; color: #94a3b8; margin-top: 0.2rem; }
+
+    .main-nav {
+      background: white;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      box-shadow: var(--shadow-sm);
+    }
+    .nav-container { max-width: 1300px; margin: 0 auto; display: flex; padding: 0 2rem; }
+    .tab-btn {
+      padding: 1rem 1.75rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: none;
+      border: none;
+      border-bottom: 3px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .tab-btn:hover { color: var(--primary); }
+    .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
+
+    main { max-width: 1300px; margin: 2rem auto; padding: 0 2rem; flex: 1; width: 100%; }
+
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; animation: fadeIn 0.2s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      padding: 1.75rem;
+      margin-bottom: 1.5rem;
+      box-shadow: var(--shadow-sm);
+    }
+    .card-title { font-size: 1.15rem; font-weight: 700; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; }
+    .card-desc { font-size: 0.88rem; color: var(--text-muted); margin-bottom: 1.25rem; }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 868px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    .dropzone {
+      border: 2px dashed #cbd5e1;
+      border-radius: 0.5rem;
+      padding: 2rem 1.5rem;
+      text-align: center;
+      cursor: pointer;
+      background: #f8fafc;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+    .dropzone:hover, .dropzone.dragover { border-color: var(--primary); background: #f0fdfa; }
+    .dropzone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+    .dropzone-icon { font-size: 2rem; color: var(--primary); margin-bottom: 0.5rem; }
+    .dropzone-text { font-weight: 600; font-size: 0.92rem; margin-bottom: 0.25rem; }
+    .dropzone-sub { font-size: 0.8rem; color: var(--text-muted); }
+
+    .file-badge-list { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .file-badge-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #f1f5f9;
+      padding: 0.6rem 0.9rem;
+      border-radius: 0.375rem;
+      font-size: 0.85rem;
+      border: 1px solid #e2e8f0;
+    }
+    .file-badge-item .fname { font-weight: 600; display: flex; align-items: center; gap: 0.4rem; overflow: hidden; text-overflow: ellipsis; }
+    .file-badge-item .prefix-input {
+      padding: 0.3rem 0.5rem;
+      border: 1px solid #cbd5e1;
+      border-radius: 0.25rem;
+      font-size: 0.82rem;
+      font-weight: 600;
+      width: 100px;
+      text-align: center;
+      text-transform: uppercase;
+    }
+
+    .pill { display: inline-flex; align-items: center; padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+    .pill-teal { background: var(--primary-light); color: var(--primary); }
+    .pill-blue { background: #dbeafe; color: #1e40af; }
+    .pill-yellow { background: var(--warning-bg); color: var(--warning-text); }
+    .pill-red { background: var(--error-bg); color: var(--error-text); }
+    .pill-green { background: var(--success-bg); color: var(--success-text); }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.75rem 1.5rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border-radius: 0.5rem;
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-decoration: none;
+    }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-secondary { background: #e2e8f0; color: #334155; }
+    .btn-secondary:hover { background: #cbd5e1; }
+    .btn-success { background: #16a34a; color: white; }
+    .btn-success:hover { background: #15803d; }
+    .btn-outline { background: white; border: 1px solid var(--border); color: var(--text); }
+    .btn-outline:hover { background: #f8fafc; border-color: #cbd5e1; }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+    .kpi-card { background: #f8fafc; border: 1px solid var(--border); border-radius: 0.5rem; padding: 1.1rem; text-align: center; }
+    .kpi-val { font-size: 1.7rem; font-weight: 700; margin-bottom: 0.2rem; }
+    .kpi-label { font-size: 0.78rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+    .table-container { overflow-x: auto; border: 1px solid var(--border); border-radius: 0.5rem; max-height: 480px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.83rem; text-align: left; }
+    th { background: #f1f5f9; padding: 0.7rem 0.9rem; font-weight: 600; color: #475569; position: sticky; top: 0; z-index: 10; border-bottom: 1px solid var(--border); }
+    td { padding: 0.65rem 0.9rem; border-bottom: 1px solid #f1f5f9; }
+    tr:hover td { background: #f8fafc; }
+
+    .status-badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 0.25rem; font-weight: 700; font-size: 0.75rem; }
+    .status-hata { background: var(--error-bg); color: var(--error-text); }
+    .status-uyari { background: var(--warning-bg); color: var(--warning-text); }
+    .status-uygun { background: var(--success-bg); color: var(--success-text); }
+
+    .search-bar { display: flex; gap: 0.75rem; margin-bottom: 1rem; }
+    .input-text { padding: 0.6rem 0.9rem; border: 1px solid var(--border); border-radius: 0.375rem; font-size: 0.88rem; outline: none; width: 100%; }
+    .input-text:focus { border-color: var(--primary); }
+
+    .filter-pills { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .filter-btn { padding: 0.4rem 0.8rem; font-size: 0.8rem; font-weight: 600; border-radius: 9999px; border: 1px solid var(--border); background: white; cursor: pointer; }
+    .filter-btn.active { background: var(--secondary); color: white; border-color: var(--secondary); }
+
+    .spinner { display: inline-block; width: 1.2rem; height: 1.2rem; border: 3px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 1s ease-in-out infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    footer { text-align: center; padding: 1.5rem; font-size: 0.8rem; color: var(--text-muted); border-top: 1px solid var(--border); background: white; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="header-container">
+      <div class="brand">
+        <h1>⚙️ SMT P&P to Excel & Canias BOM Entegrasyon Portalı</h1>
+        <p>Elektronik Üretim Hizmetleri • Pick & Place Veri İşleme • AOI Hazırlama • BOM Doğrulama Sistemi</p>
+      </div>
+      <div>
+        <span class="pill pill-teal">v1.0.0 Çevrimdışı Çalışır</span>
+      </div>
+    </div>
+  </header>
+
+  <nav class="main-nav">
+    <div class="nav-container">
+      <button class="tab-btn active" onclick="switchTab('tab-generate')">
+        <span>⚡ Modül 1: P&P -> Excel & .AOI Üretici</span>
+      </button>
+      <button class="tab-btn" onclick="switchTab('tab-validate')">
+        <span>🔍 Modül 2: Hazır Excel <-> BOM Doğrulama & Kıyaslama</span>
+      </button>
+    </div>
+  </nav>
+
+  <main>
+    <!-- ============================================================= -->
+    <!-- TAB 1: GENERATE PIPELINE -->
+    <!-- ============================================================= -->
+    <div id="tab-generate" class="tab-pane active">
+      <div class="card">
+        <h2 class="card-title">1. Dosyaları Seçin</h2>
+        <p class="card-desc">Canias ERP BOM Excel dosyasını ve müşteriden gelen ham Pick & Place (.txt, .csv, .xlsx) dosyalarını yükleyin.</p>
+
+        <div class="grid-2">
+          <!-- BOM Upload -->
+          <div>
+            <label style="font-weight: 600; font-size: 0.9rem; margin-bottom: 0.4rem; display: block;">Canias ERP BOM Dosyası (.xlsx)</label>
+            <div class="dropzone" id="bom-dropzone">
+              <input type="file" id="bom-file-input" accept=".xlsx,.csv" onchange="handleBomSelected(this.files)">
+              <div class="dropzone-icon">📋</div>
+              <div class="dropzone-text" id="bom-file-label">Canias BOM dosyasını sürükleyin veya seçin</div>
+              <div class="dropzone-sub">.xlsx veya .csv formatında ERP ürün ağacı</div>
+            </div>
+            <div id="bom-analysis-info" style="margin-top: 0.75rem; font-size: 0.83rem;"></div>
+          </div>
+
+          <!-- P&P Upload -->
+          <div>
+            <label style="font-weight: 600; font-size: 0.9rem; margin-bottom: 0.4rem; display: block;">Pick & Place Dosyaları (Tekli veya Çoklu)</label>
+            <div class="dropzone" id="pnp-dropzone">
+              <input type="file" id="pnp-files-input" multiple accept=".txt,.csv,.xlsx" onchange="handlePnpSelected(this.files)">
+              <div class="dropzone-icon">📁</div>
+              <div class="dropzone-text" id="pnp-files-label">Pick & Place dosyalarını sürükleyin veya seçin</div>
+              <div class="dropzone-sub">Altium (.txt), Cadence Allegro (.xlsx), Feka (.xlsx), CSV</div>
+            </div>
+            <div id="pnp-file-list" class="file-badge-list"></div>
+          </div>
+        </div>
+
+        <div style="margin-top: 1.5rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; border-top: 1px solid var(--border); padding-top: 1.25rem;">
+          <div style="display: flex; align-items: center; gap: 1.2rem; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 0.6rem;">
+              <label style="font-weight: 600; font-size: 0.88rem;">Proje Adı:</label>
+              <input type="text" id="project-name-input" class="input-text" style="width: 220px;" value="Proje" placeholder="Örn: MAN_Lower_Lamp">
+            </div>
+            <label style="display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.84rem; font-weight: 500; cursor: pointer;">
+              <input type="checkbox" id="chk-include-barcode" checked> Sütun I: Barkod (Canias Kodu Tekrarı)
+            </label>
+            <label style="display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.84rem; font-weight: 500; cursor: pointer;">
+              <input type="checkbox" id="chk-include-desc" checked> Sütun J: BOM Açıklama
+            </label>
+          </div>
+          <button id="btn-generate" class="btn btn-primary" onclick="startGeneration()">
+            <span>🚀 Excel ve .AOI Dosyalarını Üret</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Generation Results Section -->
+      <div id="generate-results" class="card" style="display: none;">
+        <h2 class="card-title" style="color: var(--primary);">✅ Üretim Başarıyla Tamamlandı!</h2>
+        <p class="card-desc">Tüm birim dönüşümleri yapıldı, sadece SMD malzemeler filtrelendi ve çıktılar hazırlandı.</p>
+
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-val" id="res-top-count" style="color: #0284c7;">0</div>
+            <div class="kpi-label">Top Sayfası Dizgi</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="res-bottom-count" style="color: #7c3aed;">0</div>
+            <div class="kpi-label">Bottom Sayfası Dizgi</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="res-skipped-count" style="color: #d97706;">0</div>
+            <div class="kpi-label">SMD Dışı (TH/Dummy)</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="res-unmatched-count" style="color: #dc2626;">0</div>
+            <div class="kpi-label">BOM Dışı / DNP / TP</div>
+          </div>
+        </div>
+
+        <div id="gen-filter-details" style="margin-bottom: 1.25rem; font-size: 0.83rem; display: none;"></div>
+
+        <!-- Download Buttons -->
+        <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1.5rem;">
+          <a id="btn-dl-zip" class="btn btn-success" href="#">📦 Tümünü İndir (.ZIP)</a>
+          <a id="btn-dl-excel" class="btn btn-outline" href="#">📊 Son Halindeki Excel (.xlsx)</a>
+          <a id="btn-dl-top-aoi" class="btn btn-outline" href="#">⚙️ Top.AOI</a>
+          <a id="btn-dl-bot-aoi" class="btn btn-outline" href="#">⚙️ Bottom.AOI</a>
+        </div>
+
+        <!-- Table Previews -->
+        <div style="display: flex; gap: 1rem; border-bottom: 1px solid var(--border); margin-bottom: 1rem;">
+          <button class="tab-btn active" style="padding: 0.5rem 1rem;" onclick="switchPreview('top')">Top Önizleme (İlk 10 Satır)</button>
+          <button class="tab-btn" style="padding: 0.5rem 1rem;" onclick="switchPreview('bot')">Bottom Önizleme (İlk 10 Satır)</button>
+        </div>
+
+        <div id="preview-top-container" class="table-container">
+          <table id="table-top-preview">
+            <thead>
+              <tr>
+                <th>A (RefDes)</th><th>B (Center-X)</th><th>C (Center-Y)</th><th>D (Rotation)</th>
+                <th>E (Layer)</th><th>F (Birleşik Kılıf)</th><th>G (Birleşik Tanım)</th>
+                <th>H (Canias Kodu)</th><th>I (Barkod)</th><th>J (Açıklama)</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div id="preview-bot-container" class="table-container" style="display: none;">
+          <table id="table-bot-preview">
+            <thead>
+              <tr>
+                <th>A (RefDes)</th><th>B (Center-X)</th><th>C (Center-Y)</th><th>D (Rotation)</th>
+                <th>E (Layer)</th><th>F (Birleşik Kılıf)</th><th>G (Birleşik Tanım)</th>
+                <th>H (Canias Kodu)</th><th>I (Barkod)</th><th>J (Açıklama)</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================= -->
+    <!-- TAB 2: VALIDATE EXISTING EXCEL AGAINST BOM -->
+    <!-- ============================================================= -->
+    <div id="tab-validate" class="tab-pane">
+      <div class="card">
+        <h2 class="card-title">🔍 Hazırlanmış Final Excel ile Güncel Canias BOM Karşılaştırma</h2>
+        <p class="card-desc">Daha önceden çalışanlar tarafından hazırlanan Pick & Place Excel dosyasını güncel Canias ERP BOM ile karşılaştırarak sonradan yapılan malzeme kodu, değer, kılıf değişikliklerini veya eksik/fazla referansları anında denetleyin.</p>
+
+        <div class="grid-2">
+          <!-- Prepared Excel Upload -->
+          <div>
+            <label style="font-weight: 600; font-size: 0.9rem; margin-bottom: 0.4rem; display: block;">Hazırlanmış Final Excel Dosyası (.xlsx)</label>
+            <div class="dropzone" id="val-excel-dropzone">
+              <input type="file" id="val-excel-input" accept=".xlsx" onchange="handleValExcelSelected(this.files)">
+              <div class="dropzone-icon">📊</div>
+              <div class="dropzone-text" id="val-excel-label">Daha önce hazırlanmış Excel dosyasını seçin</div>
+              <div class="dropzone-sub">Top ve Bottom sayfalarını içeren çalışma kitabı</div>
+            </div>
+          </div>
+
+          <!-- Current BOM Upload -->
+          <div>
+            <label style="font-weight: 600; font-size: 0.9rem; margin-bottom: 0.4rem; display: block;">Güncel Canias ERP BOM Dosyası (.xlsx)</label>
+            <div class="dropzone" id="val-bom-dropzone">
+              <input type="file" id="val-bom-input" accept=".xlsx,.csv" onchange="handleValBomSelected(this.files)">
+              <div class="dropzone-icon">📋</div>
+              <div class="dropzone-text" id="val-bom-label">Güncel Canias BOM dosyasını seçin</div>
+              <div class="dropzone-sub">ERP'den yeni indirilmiş güncel ürün ağacı</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top: 1.5rem; display: flex; align-items: center; justify-content: flex-end; border-top: 1px solid var(--border); padding-top: 1.25rem;">
+          <button id="btn-validate" class="btn btn-primary" onclick="startValidation()">
+            <span>🔍 Karşılaştır ve Hataları Denetle</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Validation Results Section -->
+      <div id="validate-results" class="card" style="display: none;">
+        <h2 class="card-title">📊 Denetim ve Kıyaslama Sonuçları</h2>
+        <p class="card-desc">Hazırlanan Excel ile güncel BOM arasındaki tüm uyuşmazlıklar ve revizyonlar aşağıda listelenmiştir.</p>
+
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="kpi-val" id="val-kpi-total">0</div>
+            <div class="kpi-label">Toplam Kontrol Edilen</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="val-kpi-accuracy" style="color: var(--primary);">%0</div>
+            <div class="kpi-label">Doğruluk Skoru</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="val-kpi-matched" style="color: #16a34a;">0</div>
+            <div class="kpi-label">Birebir Uyumlu</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="val-kpi-errors" style="color: #dc2626;">0</div>
+            <div class="kpi-label">Kritik Hata / Değişiklik</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="val-kpi-warnings" style="color: #d97706;">0</div>
+            <div class="kpi-label">Uyarı (Yazım/Format)</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-val" id="val-kpi-missing" style="color: #ea580c;">0</div>
+            <div class="kpi-label">Excel'de Unutulan RefDes</div>
+          </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1.5rem;">
+          <a id="btn-dl-val-report" class="btn btn-primary" href="#">📑 Detaylı Karşılaştırma Raporunu İndir (.xlsx)</a>
+          <a id="btn-dl-val-repaired" class="btn btn-success" href="#">🪄 Güncel BOM'a Göre Düzeltilmiş Excel'i İndir (.xlsx)</a>
+          <a id="btn-dl-val-zip" class="btn btn-outline" href="#">📦 Düzeltilmiş Excel + .AOI Dosyalarını İndir (.ZIP)</a>
+        </div>
+
+        <!-- Filter & Search Controls -->
+        <div class="search-bar">
+          <input type="text" id="val-search-input" class="input-text" placeholder="Yerleşim Yeri (RefDes), Malzeme Kodu veya Açıklama ile filtrele..." oninput="renderValidationTable()">
+        </div>
+
+        <div class="filter-pills">
+          <button class="filter-btn active" onclick="setValFilter('ALL', this)">Tümü (<span id="count-all">0</span>)</button>
+          <button class="filter-btn" onclick="setValFilter('HATA', this)">Yalnızca Hatalar (<span id="count-hata">0</span>)</button>
+          <button class="filter-btn" onclick="setValFilter('UYARI', this)">Yalnızca Uyarılar (<span id="count-uyari">0</span>)</button>
+          <button class="filter-btn" onclick="setValFilter('EKSIK_REFDES', this)">Excel'de Eksikler (<span id="count-eksik">0</span>)</button>
+          <button class="filter-btn" onclick="setValFilter('FAZLA_REFDES', this)">BOM'dan Silinenler</button>
+          <button class="filter-btn" onclick="setValFilter('SMD_DISI', this)">SMD Dışı Eklenenler</button>
+          <button class="filter-btn" onclick="setValFilter('CANIAS_KODU', this)">Stok Kodu Değişenler</button>
+          <button class="filter-btn" onclick="setValFilter('DEGER_PARAMETRE', this)">Değer/Tanım Değişenler</button>
+        </div>
+
+        <div class="table-container">
+          <table id="table-validation-differences">
+            <thead>
+              <tr>
+                <th>Durum</th>
+                <th>Sayfa</th>
+                <th>Yerleşim Yeri</th>
+                <th>Kategori</th>
+                <th>Hata / Fark Nedeni</th>
+                <th>Excel'deki Mevcut Değer</th>
+                <th>Güncel Canias BOM Değeri</th>
+                <th>Satır</th>
+              </tr>
+            </thead>
+            <tbody id="val-diff-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <p>DEKA Elektronik Üretim Hizmetleri & NPI Otomasyon Mühendisliği • Uçtan Uca Pick & Place & BOM Entegrasyon Portalı</p>
+  </footer>
+
+  <script>
+    // Tab switching
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.nav-container .tab-btn').forEach(el => el.classList.remove('active'));
+      document.getElementById(tabId).classList.add('active');
+      event.currentTarget.classList.add('active');
+    }
+
+    function switchPreview(side) {
+      if (side === 'top') {
+        document.getElementById('preview-top-container').style.display = 'block';
+        document.getElementById('preview-bot-container').style.display = 'none';
+      } else {
+        document.getElementById('preview-top-container').style.display = 'none';
+        document.getElementById('preview-bot-container').style.display = 'block';
+      }
+      event.target.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      event.target.classList.add('active');
+    }
+
+    // Tab 1 state
+    let selectedBomFile = null;
+    let selectedPnpFiles = [];
+    let detectedBomPrefixes = {};
+
+    function handleBomSelected(files) {
+      if (!files.length) return;
+      selectedBomFile = files[0];
+      document.getElementById('bom-file-label').textContent = selectedBomFile.name;
+      
+      // Auto analyze BOM to extract prefixes
+      const formData = new FormData();
+      formData.append('bom_file', selectedBomFile);
+      
+      const infoBox = document.getElementById('bom-analysis-info');
+      infoBox.innerHTML = '<em>BOM analiz ediliyor ve kart önekleri taranıyor...</em>';
+
+      fetch('/api/analyze-bom', { method: 'POST', body: formData })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            detectedBomPrefixes = data.detected_prefixes || {};
+            const pfxKeys = Object.keys(detectedBomPrefixes);
+            let pfxBadges = pfxKeys.map(k => `<span class="pill pill-teal">${k}</span>`).join(' ');
+            infoBox.innerHTML = `
+              <div style="background: #f0fdfa; border: 1px solid #ccfbf1; padding: 0.6rem; border-radius: 0.375rem;">
+                <strong>✓ BOM Başarıyla Okundu:</strong> ${data.smd_item_count} SMD kalem (${data.smd_ref_count} RefDes) • ${data.non_smd_count} SMD Dışı (TH/Sarf/Dummy) kalem.<br>
+                ${pfxKeys.length > 0 ? `<strong>Tespit Edilen Kart Önekleri:</strong> ${pfxBadges}` : '<em>Tekli kart yapısı (Önek yok).</em>'}
+              </div>
+            `;
+            // Re-suggest prefixes for already loaded PNP files
+            renderPnpFileList();
+          } else {
+            infoBox.innerHTML = `<span style="color: var(--error-text);">Hata: ${data.detail}</span>`;
+          }
+        })
+        .catch(err => {
+          infoBox.innerHTML = `<span style="color: var(--error-text);">Analiz hatası: ${err.message}</span>`;
+        });
+    }
+
+    function handlePnpSelected(files) {
+      selectedPnpFiles = Array.from(files);
+      document.getElementById('pnp-files-label').textContent = `${selectedPnpFiles.length} Pick & Place dosyası seçildi`;
+      renderPnpFileList();
+    }
+
+    function suggestPrefix(filename) {
+      const base = filename.replace(/\.[^.]+$/, '');
+      const tokens = base.split(/[\s_\-]+/).filter(Boolean);
+      const knownPfxs = Object.keys(detectedBomPrefixes).map(k => k.toUpperCase());
+
+      // 1. Extract CamelCase acronyms from filename tokens (e.g., StopTail1 -> ST1, FogMain -> FM, TurnRev2 -> TR2)
+      const acronyms = [];
+      for (const tok of tokens) {
+        if (/[a-z]/.test(tok) && /[A-Z]/.test(tok)) {
+          const matches = tok.match(/[A-Z]|\d+/g);
+          if (matches && matches.join('').length >= 2) {
+            acronyms.push(matches.join('').toUpperCase());
+          }
+        }
+        const tokUp = tok.toUpperCase();
+        if (knownPfxs.includes(tokUp)) return tokUp;
+      }
+
+      if (knownPfxs.length > 0) {
+        for (const acr of acronyms) {
+          if (knownPfxs.includes(acr)) return acr;
+        }
+        const fnUp = base.toUpperCase();
+        const sortedKnown = [...knownPfxs].sort((a, b) => b.length - a.length);
+        for (const pfx of sortedKnown) {
+          if (fnUp.includes(pfx)) return pfx;
+        }
+      }
+
+      const ignore = ['HW01', 'HW02', 'HW03', 'SW01', 'V1', 'V2', 'V8'];
+      for (const acr of acronyms) {
+        if (!ignore.includes(acr) && !acr.startsWith('HW')) return acr;
+      }
+      return '';
+    }
+
+    function renderPnpFileList() {
+      const container = document.getElementById('pnp-file-list');
+      container.innerHTML = '';
+      if (!selectedPnpFiles.length) return;
+
+      selectedPnpFiles.forEach((file, idx) => {
+        const item = document.createElement('div');
+        item.className = 'file-badge-item';
+        const suggested = suggestPrefix(file.name);
+        item.innerHTML = `
+          <div class="fname" title="${file.name}">📄 ${file.name}</div>
+          <div style="display: flex; align-items: center; gap: 0.4rem;">
+            <label style="font-size: 0.78rem; color: var(--text-muted);">Önek (Prefix):</label>
+            <input type="text" class="prefix-input" id="pfx-input-${idx}" value="${suggested}" placeholder="Örn: ST1">
+          </div>
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    function startGeneration() {
+      if (!selectedBomFile) {
+        alert('Lütfen önce bir Canias ERP BOM dosyası seçin.');
+        return;
+      }
+      if (!selectedPnpFiles.length) {
+        alert('Lütfen en az bir Pick & Place dosyası seçin.');
+        return;
+      }
+
+      const btn = document.getElementById('btn-generate');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> İşleniyor, lütfen bekleyin...';
+
+      const formData = new FormData();
+      formData.append('bom_file', selectedBomFile);
+      selectedPnpFiles.forEach(f => formData.append('pnp_files', f));
+
+      const prefixMap = {};
+      selectedPnpFiles.forEach((f, idx) => {
+        const inp = document.getElementById(`pfx-input-${idx}`);
+        if (inp) {
+          prefixMap[f.name] = inp.value.trim().toUpperCase();
+        }
+      });
+      formData.append('prefixes_json', JSON.stringify(prefixMap));
+      formData.append('project_name', document.getElementById('project-name-input').value.trim() || 'Proje');
+      formData.append('include_barcode', document.getElementById('chk-include-barcode').checked);
+      formData.append('include_description', document.getElementById('chk-include-desc').checked);
+
+      fetch('/api/generate', { method: 'POST', body: formData })
+        .then(r => r.json())
+        .then(data => {
+          btn.disabled = false;
+          btn.innerHTML = '<span>🚀 Excel ve .AOI Dosyalarını Üret</span>';
+
+          if (data.success) {
+            document.getElementById('generate-results').style.display = 'block';
+            document.getElementById('res-top-count').textContent = data.report.top_count;
+            document.getElementById('res-bottom-count').textContent = data.report.bottom_count;
+            document.getElementById('res-skipped-count').textContent = data.report.skipped_non_smd_count;
+            document.getElementById('res-unmatched-count').textContent = data.report.unmatched_count;
+
+            const filterBox = document.getElementById('gen-filter-details');
+            const skippedList = (data.report.skipped_samples || []).map(s => `<span class="pill pill-yellow">${s.ref} (${s.reason})</span>`).join(' ');
+            const unmatchedList = (data.report.unmatched_samples || []).map(u => `<span class="pill pill-red">${u}</span>`).join(' ');
+            if (skippedList || unmatchedList) {
+              filterBox.style.display = 'block';
+              filterBox.innerHTML = `
+                <div style="background: #f8fafc; border: 1px solid var(--border); padding: 0.75rem 1rem; border-radius: 0.5rem;">
+                  ${skippedList ? `<div style="margin-bottom: 0.4rem;"><strong>SMD Dışı Olduğu İçin Çıktıya Yazılmayanlar:</strong> ${skippedList}</div>` : ''}
+                  ${unmatchedList ? `<div><strong>BOM'da Yer Almayanlar (DNP / Test Point / Fiducial):</strong> ${unmatchedList}</div>` : ''}
+                </div>
+              `;
+            } else {
+              filterBox.style.display = 'none';
+            }
+
+            // Setup download links
+            document.getElementById('btn-dl-zip').href = `/api/download/${data.job_id}/zip_all`;
+            document.getElementById('btn-dl-excel').href = `/api/download/${data.job_id}/final_excel`;
+            document.getElementById('btn-dl-top-aoi').href = `/api/download/${data.job_id}/top_aoi`;
+            document.getElementById('btn-dl-bot-aoi').href = `/api/download/${data.job_id}/bottom_aoi`;
+
+            // Render previews
+            renderPreviewTable('table-top-preview', data.top_preview);
+            renderPreviewTable('table-bot-preview', data.bottom_preview);
+
+            document.getElementById('generate-results').scrollIntoView({ behavior: 'smooth' });
+          } else {
+            alert('Hata: ' + (data.detail || 'Bilinmeyen bir hata oluştu.'));
+          }
+        })
+        .catch(err => {
+          btn.disabled = false;
+          btn.innerHTML = '<span>🚀 Excel ve .AOI Dosyalarını Üret</span>';
+          alert('Sunucu hatası: ' + err.message);
+        });
+    }
+
+    function renderPreviewTable(tableId, rows) {
+      const tbody = document.querySelector(`#${tableId} tbody`);
+      tbody.innerHTML = '';
+      if (!rows || !rows.length) {
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: var(--text-muted);">Veri yok.</td></tr>';
+        return;
+      }
+      rows.forEach(r => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = r.map(val => `<td>${val || ''}</td>`).join('');
+        tbody.appendChild(tr);
+      });
+    }
+
+    // =============================================================
+    // TAB 2: VALIDATION LOGIC
+    // =============================================================
+    let selectedValExcel = null;
+    let selectedValBom = null;
+    let validationDifferences = [];
+    let currentValFilter = 'ALL';
+
+    function handleValExcelSelected(files) {
+      if (!files.length) return;
+      selectedValExcel = files[0];
+      document.getElementById('val-excel-label').textContent = selectedValExcel.name;
+    }
+
+    function handleValBomSelected(files) {
+      if (!files.length) return;
+      selectedValBom = files[0];
+      document.getElementById('val-bom-label').textContent = selectedValBom.name;
+    }
+
+    function startValidation() {
+      if (!selectedValExcel) {
+        alert('Lütfen hazırlanmış Final Excel dosyasını seçin.');
+        return;
+      }
+      if (!selectedValBom) {
+        alert('Lütfen güncel Canias ERP BOM dosyasını seçin.');
+        return;
+      }
+
+      const btn = document.getElementById('btn-validate');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Karşılaştırılıyor...';
+
+      const formData = new FormData();
+      formData.append('excel_file', selectedValExcel);
+      formData.append('bom_file', selectedValBom);
+      formData.append('project_name', 'Denetim');
+
+      fetch('/api/validate', { method: 'POST', body: formData })
+        .then(r => r.json())
+        .then(data => {
+          btn.disabled = false;
+          btn.innerHTML = '<span>🔍 Karşılaştır ve Hataları Denetle</span>';
+
+          if (data.success) {
+            document.getElementById('validate-results').style.display = 'block';
+            validationDifferences = data.differences || [];
+
+            // Update KPIs
+            document.getElementById('val-kpi-total').textContent = data.summary.total_checked;
+            document.getElementById('val-kpi-accuracy').textContent = `%${data.summary.accuracy_percent}`;
+            document.getElementById('val-kpi-matched').textContent = data.summary.match_count;
+            document.getElementById('val-kpi-errors').textContent = data.summary.error_count;
+            document.getElementById('val-kpi-warnings').textContent = data.summary.warning_count;
+            document.getElementById('val-kpi-missing').textContent = data.summary.missing_in_excel;
+
+            // Counts for filter pills
+            document.getElementById('count-all').textContent = validationDifferences.length;
+            document.getElementById('count-hata').textContent = validationDifferences.filter(d => d.status === 'HATA').length;
+            document.getElementById('count-uyari').textContent = validationDifferences.filter(d => d.status === 'UYARI').length;
+            document.getElementById('count-eksik').textContent = validationDifferences.filter(d => d.category === 'EKSIK_REFDES').length;
+
+            // Download links
+            document.getElementById('btn-dl-val-report').href = `/api/download/${data.job_id}/validation_report`;
+            document.getElementById('btn-dl-val-repaired').href = `/api/download/${data.job_id}/repaired_excel`;
+            document.getElementById('btn-dl-val-zip').href = `/api/download/${data.job_id}/repaired_zip`;
+
+            renderValidationTable();
+            document.getElementById('validate-results').scrollIntoView({ behavior: 'smooth' });
+          } else {
+            alert('Doğrulama hatası: ' + (data.detail || 'Bilinmeyen hata'));
+          }
+        })
+        .catch(err => {
+          btn.disabled = false;
+          btn.innerHTML = '<span>🔍 Karşılaştır ve Hataları Denetle</span>';
+          alert('Sunucu hatası: ' + err.message);
+        });
+    }
+
+    function setValFilter(filterType, btnEl) {
+      currentValFilter = filterType;
+      document.querySelectorAll('.filter-pills .filter-btn').forEach(b => b.classList.remove('active'));
+      btnEl.classList.add('active');
+      renderValidationTable();
+    }
+
+    function renderValidationTable() {
+      const search = (document.getElementById('val-search-input').value || '').trim().toUpperCase();
+      const tbody = document.getElementById('val-diff-tbody');
+      tbody.innerHTML = '';
+
+      const filtered = validationDifferences.filter(d => {
+        // Status/Category filter
+        if (currentValFilter === 'HATA' && d.status !== 'HATA') return false;
+        if (currentValFilter === 'UYARI' && d.status !== 'UYARI') return false;
+        if (currentValFilter === 'EKSIK_REFDES' && d.category !== 'EKSIK_REFDES') return false;
+        if (currentValFilter === 'FAZLA_REFDES' && d.category !== 'FAZLA_REFDES') return false;
+        if (currentValFilter === 'SMD_DISI' && d.category !== 'SMD_DISI') return false;
+        if (currentValFilter === 'CANIAS_KODU' && d.category !== 'CANIAS_KODU') return false;
+        if (currentValFilter === 'DEGER_PARAMETRE' && d.category !== 'DEGER_PARAMETRE') return false;
+
+        // Search text
+        if (search) {
+          const combined = `${d.refdes} ${d.excel_val} ${d.bom_val} ${d.detail}`.toUpperCase();
+          if (!combined.includes(search)) return false;
+        }
+        return true;
+      });
+
+      if (!filtered.length) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 2rem; color: var(--text-muted);">Bu filtreye uygun kayıt bulunamadı.</td></tr>';
+        return;
+      }
+
+      filtered.forEach(d => {
+        const tr = document.createElement('tr');
+        const badgeClass = d.status === 'HATA' ? 'status-hata' : (d.status === 'UYARI' ? 'status-uyari' : 'status-uygun');
+        tr.innerHTML = `
+          <td><span class="status-badge ${badgeClass}">${d.status}</span></td>
+          <td>${d.side || '-'}</td>
+          <td><strong>${d.refdes}</strong></td>
+          <td><span class="pill pill-blue">${d.category}</span></td>
+          <td>${d.detail}</td>
+          <td style="color: #b91c1c; font-family: monospace;">${d.excel_val || '-'}</td>
+          <td style="color: #15803d; font-family: monospace;">${d.bom_val || '-'}</td>
+          <td style="color: var(--text-muted);">${d.row}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+  </script>
+</body>
+</html>
