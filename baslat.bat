@@ -9,16 +9,50 @@ echo ======================================================================
 echo.
 
 if not exist ".venv\Scripts\python.exe" (
-    echo [1/3] Sanal ortam olusturuluyor: .venv ...
-    python -m venv .venv 2>nul
-    if not exist ".venv\Scripts\python.exe" (
-        py -m venv .venv 2>nul
+    echo [1/3] Python ortami kontrol ediliyor...
+    set "PY_CMD="
+
+    python -c "import sys; assert sys.version_info >= (3, 9)" >nul 2>nul
+    if not errorlevel 1 set "PY_CMD=python"
+
+    if not defined PY_CMD (
+        py -3 -c "import sys; assert sys.version_info >= (3, 9)" >nul 2>nul
+        if not errorlevel 1 set "PY_CMD=py -3"
     )
+
+    if not defined PY_CMD (
+        for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "C:\Program Files\Python3*") do (
+            if exist "%%~fD\python.exe" (
+                set "PY_CMD="%%~fD\python.exe""
+            )
+        )
+    )
+
+    if not defined PY_CMD (
+        echo Python bulunamadi. Windows uzerinden Python 3.11 otomatik kuruluyor...
+        winget install -e --id Python.Python.3.11 --scope user --accept-package-agreements --accept-source-agreements
+        for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "C:\Program Files\Python3*") do (
+            if exist "%%~fD\python.exe" (
+                set "PY_CMD="%%~fD\python.exe""
+            )
+        )
+    )
+
+    if not defined PY_CMD (
+        echo.
+        echo [HATA] Python otomatik kurulamadi!
+        echo Lutfen https://www.python.org/downloads/ adresinden Python 3.11 indirin
+        echo ve kurulumda "Add Python to PATH" kutucugunu isaretleyin.
+        echo.
+        pause
+        exit /b 1
+    )
+
+    echo [1/3] Sanal ortam olusturuluyor: .venv ...
+    !PY_CMD! -m venv .venv
     if not exist ".venv\Scripts\python.exe" (
         echo.
-        echo [HATA] Python bulunamadi!
-        echo Lutfen Python 3.10 veya uzerini yukleyin ve PATH secenegini isaretleyin.
-        echo.
+        echo [HATA] Sanal ortam olusturulamadi!
         pause
         exit /b 1
     )
@@ -26,7 +60,8 @@ if not exist ".venv\Scripts\python.exe" (
 
 ".venv\Scripts\python.exe" -c "import uvicorn, openpyxl, multipart, pp_to_excel" >nul 2>nul
 if errorlevel 1 (
-    echo [2/3] Gerekli paketler yukleniyor, lutfen bekleyin...
+    echo [2/3] Gerekli kutuphaneler yukleniyor, lutfen bekleyin...
+    ".venv\Scripts\python.exe" -m pip install --upgrade pip --trusted-host pypi.org --trusted-host files.pythonhosted.org >nul 2>nul
     ".venv\Scripts\python.exe" -m pip install -e . --trusted-host pypi.org --trusted-host files.pythonhosted.org
     if errorlevel 1 (
         echo.
@@ -49,7 +84,7 @@ start http://127.0.0.1:8000
 
 echo.
 echo ======================================================================
-echo Sunucu aktif! Bu pencereyi kapatirsaniz uygulama sonlanir.
+echo Sunucu aktif! Bu siyah pencereyi kapatirsaniz uygulama durur.
 echo ======================================================================
 echo.
 
