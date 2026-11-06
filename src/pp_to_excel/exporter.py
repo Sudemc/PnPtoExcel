@@ -33,6 +33,7 @@ def export_final_excel(
         row_vals = row.to_row_values(include_barcode=include_barcode, include_description=include_description)
         for c_idx, val in enumerate(row_vals, start=1):
             cell = ws_top.cell(row=r_idx, column=c_idx)
+            cell.number_format = '@'
             cell.value = str(val)
 
     # Setup Bottom sheet
@@ -41,6 +42,7 @@ def export_final_excel(
         row_vals = row.to_row_values(include_barcode=include_barcode, include_description=include_description)
         for c_idx, val in enumerate(row_vals, start=1):
             cell = ws_bot.cell(row=r_idx, column=c_idx)
+            cell.number_format = '@'
             cell.value = str(val)
 
     wb.save(output_path)

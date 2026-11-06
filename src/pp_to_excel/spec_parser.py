@@ -406,11 +406,14 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
     desc = (description or "").strip()
     desc_up = desc.upper()
 
-    # 1. Determine component group
+    # 1. Determine component group and special flags (NTC, Jumper)
+    is_ntc = bool(c_code.startswith("TER") or re.search(r"\bNTC\b", desc_up))
+    is_jumper = bool(re.search(r"\bJUMPER\b", desc_up))
+
     comp_type = "OTHER"
     if c_code.startswith("CAP") or desc_up.startswith("SMD CAP") or "CAPACITOR" in desc_up or "TANTAL" in desc_up or "ALUMINIUM ELEC" in desc_up:
         comp_type = "CAPACITOR"
-    elif c_code.startswith("RES") or c_code.startswith("TER") or "RESISTOR" in desc_up or ", NTC," in f" {desc_up}" or ", PTC," in f" {desc_up}":
+    elif c_code.startswith("RES") or c_code.startswith("TER") or is_ntc or "RESISTOR" in desc_up or ", NTC," in f" {desc_up}" or ", PTC," in f" {desc_up}":
         comp_type = "RESISTOR"
     elif c_code.startswith("IND") or c_code.startswith("TRF") or "INDUCTOR" in desc_up or "FERRITE" in desc_up or "F.BEAD" in desc_up or "BEAD" in desc_up or "CHOKE" in desc_up:
         comp_type = "INDUCTOR"
@@ -433,6 +436,7 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
     tolerance = parse_tolerance(desc)
 
     # 4. Form Column F (combined_package)
+    # NTC kuralı: Kılıf başında R yerine NTC yazılır (örn. NTC0603)
     if comp_type == "CAPACITOR":
         if package in CHIP_SIZES:
             combined_package = f"C{package}"
@@ -441,12 +445,20 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
         else:
             combined_package = "SMD"
     elif comp_type == "RESISTOR":
-        if package in CHIP_SIZES or package in ("0207", "4x0402", "4x0603"):
-            combined_package = f"R{package}"
-        elif package:
-            combined_package = package
+        if is_ntc:
+            if package in CHIP_SIZES or package in ("0207", "4x0402", "4x0603"):
+                combined_package = f"NTC{package}"
+            elif package:
+                combined_package = f"NTC_{package}"
+            else:
+                combined_package = "NTC"
         else:
-            combined_package = "SMD"
+            if package in CHIP_SIZES or package in ("0207", "4x0402", "4x0603"):
+                combined_package = f"R{package}"
+            elif package:
+                combined_package = package
+            else:
+                combined_package = "SMD"
     elif comp_type == "INDUCTOR":
         if package in CHIP_SIZES:
             combined_package = f"L{package}"
@@ -458,8 +470,18 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
         combined_package = package if package else "SMD"
 
     # 5. Determine Primary Value / Part Name & Form Column G (combined_spec)
+    # Kural: % işareti kaldırılır, sadece sayısı yazılır (örn. %1 -> 1). %5 dışındakiler yazılır.
+    # Jumper kuralı: Açıklamada Jumper varsa sonuna _Jumper eklenir.
+    # NTC kuralı: NTC ise tolerans/sayıdan sonra _NTC eklenir.
     primary_val = ""
     clean_mpn = clean_part_number(mpn_str)
+
+    def _format_tol(tol: Optional[str]) -> Optional[str]:
+        if not tol or tol == "%5":
+            return None
+        return tol.replace("%", "").strip()
+
+    tol_clean = _format_tol(tolerance)
 
     if comp_type == "CAPACITOR":
         c_val = parse_capacitance(desc)
@@ -469,6 +491,8 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
         spec_parts = [primary_val, package if package else "SMD"]
         if voltage and voltage.upper() != "50V":
             spec_parts.append(voltage)
+        if is_jumper:
+            spec_parts.append("Jumper")
         combined_spec = "_".join(p for p in spec_parts if p)
 
     elif comp_type in ("RESISTOR", "INDUCTOR", "CRYSTAL", "FUSE"):
@@ -490,10 +514,14 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
         else:
             primary_val = clean_mpn
 
-        # Passives: NEVER add voltage! Add tolerance ONLY if tolerance != %5
+        # Passives: NEVER add voltage! Add tolerance (without %) ONLY if tolerance != %5
         spec_parts = [primary_val, package if package else "SMD"]
-        if tolerance and tolerance != "%5":
-            spec_parts.append(tolerance)
+        if tol_clean:
+            spec_parts.append(tol_clean)
+        if is_ntc:
+            spec_parts.append("NTC")
+        if is_jumper:
+            spec_parts.append("Jumper")
         combined_spec = "_".join(p for p in spec_parts if p)
 
     elif comp_type == "SEMICONDUCTOR":
@@ -503,15 +531,19 @@ def parse_specs(canias_code: str, mpn_raw: str, description: str) -> ParsedSpec:
 
         # Actives: NEVER add voltage! Add tolerance ONLY if tolerance != %5
         spec_parts = [primary_val, package if package else "SMD"]
-        if tolerance and tolerance != "%5":
-            spec_parts.append(tolerance)
+        if tol_clean:
+            spec_parts.append(tol_clean)
+        if is_jumper:
+            spec_parts.append("Jumper")
         combined_spec = "_".join(p for p in spec_parts if p)
 
     else:
         primary_val = clean_mpn if clean_mpn else c_code
         spec_parts = [primary_val, package if package else "SMD"]
-        if tolerance and tolerance != "%5":
-            spec_parts.append(tolerance)
+        if tol_clean:
+            spec_parts.append(tol_clean)
+        if is_jumper:
+            spec_parts.append("Jumper")
         combined_spec = "_".join(p for p in spec_parts if p)
 
     return ParsedSpec(
@@ -600,6 +632,12 @@ def are_specs_semantically_equivalent(spec_a: str, spec_b: str) -> Tuple[bool, s
     b_clean = (spec_b or "").strip()
     if a_clean.upper() == b_clean.upper():
         return (True, "Birebir Uyuşuyor")
+
+    # Normalize away % sign for tolerance comparison
+    a_norm_tol = re.sub(r"%(\d)", r"\1", a_clean)
+    b_norm_tol = re.sub(r"%(\d)", r"\1", b_clean)
+    if a_norm_tol.upper() == b_norm_tol.upper():
+        return (True, f"Semantik Denk: {a_clean} == {b_clean} (% yazım farkı)")
 
     parts_a = a_clean.split("_")
     parts_b = b_clean.split("_")

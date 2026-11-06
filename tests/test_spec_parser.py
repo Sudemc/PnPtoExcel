@@ -31,7 +31,7 @@ def test_active_semiconductor_screenshot_rule():
 def test_resistor_with_tolerance_not_5_percent():
     """
     Kalem 120: RESSS24990BF08GN-MIK | HM0013 (RC0603FR-0749R9L) | SMD 0603 Package, 49R9, %1, 1/10W, Thick Film, General, Mikrodev (Yageo)
-    Should produce Col F: R0603, Col G: 49R9_0603_%1
+    Rule: % is stripped, only number is written -> 49R9_0603_1
     """
     spec = parse_specs(
         canias_code="RESSS24990BF08GN-MIK",
@@ -43,12 +43,12 @@ def test_resistor_with_tolerance_not_5_percent():
     assert spec.combined_package == "R0603"
     assert spec.primary_val == "49R9"
     assert spec.tolerance == "%1"
-    assert spec.combined_spec == "49R9_0603_%1"
+    assert spec.combined_spec == "49R9_0603_1"
 
 
 def test_resistor_with_5_percent_tolerance_omitted():
     """
-    Resistors with %5 should NOT have % in Column G.
+    Resistors with %5 should NOT have tolerance in Column G.
     """
     spec = parse_specs(
         canias_code="RESSS11002FC08AU-YG",
@@ -57,6 +57,34 @@ def test_resistor_with_5_percent_tolerance_omitted():
     )
     assert spec.combined_package == "R0402"
     assert spec.combined_spec == "10k_0402"
+
+
+def test_jumper_rule():
+    """
+    Resistors or jumpers with 'Jumper' in description should append _Jumper to Column G.
+    """
+    spec = parse_specs(
+        canias_code="RESSS200000FC08AU-YG",
+        mpn_raw="RC0603JR-070RL",
+        description="SMD 0603 Package, 0R, Jumper, 1/10W, General, Yageo"
+    )
+    assert spec.combined_package == "R0603"
+    assert spec.combined_spec == "0R_0603_Jumper"
+
+
+def test_ntc_rule():
+    """
+    NTC components:
+    - Column F: R prefix replaced with NTC -> NTC0603
+    - Column G: _NTC appended after tolerance number -> 10k_0603_1_NTC
+    """
+    spec = parse_specs(
+        canias_code="TERSS21002FB08B-M-P",
+        mpn_raw="M-PLUSTEC(NCP18XH103F03RB)",
+        description="SMD 0603 Package, 10k, %1, 0.1mW, NTC, M-Plustec(Murata)"
+    )
+    assert spec.combined_package == "NTC0603"
+    assert spec.combined_spec == "10k_0603_1_NTC"
 
 
 def test_capacitor_50v_omitted():
@@ -98,7 +126,10 @@ def test_semantic_equivalence():
     equiv, msg = are_specs_semantically_equivalent("0.1uF_0603", "100nF_0603")
     assert equiv is True
 
-    equiv, msg = are_specs_semantically_equivalent("4k7_0603_%1", "4.7k_0603_%1")
+    equiv, msg = are_specs_semantically_equivalent("4k7_0603_1", "4.7k_0603_1")
+    assert equiv is True
+
+    equiv, msg = are_specs_semantically_equivalent("49R9_0603_1", "49R9_0603_%1")
     assert equiv is True
 
     equiv, msg = are_specs_semantically_equivalent("10nF_0603", "100nF_0603")
@@ -113,16 +144,16 @@ def test_edge_cases_from_real_boms():
         description="SMD 0603 Package, 25K5 %1, 1/10W, Thick Film, General, Mikrodev (Yageo)"
     )
     assert s1.combined_package == "R0603"
-    assert s1.combined_spec == "25k5_0603_%1"
+    assert s1.combined_spec == "25k5_0603_1"
 
-    # 2. Resistor value ending with digit before space + %1 ('60R4 %1' must be %1, NOT %4)
+    # 2. Resistor value ending with digit before space + %1 ('60R4 %1' must be 1, NOT 4)
     s2 = parse_specs(
         canias_code="RESSS26040BF08GN-MIK",
         mpn_raw="HM0038 (RC0603FR-0760R4L)",
         description="SMD 0603 Package, 60R4 %1, 1/10W, Thick Film, General, Mikrodev (Yageo)"
     )
     assert s2.tolerance == "%1"
-    assert s2.combined_spec == "60R4_0603_%1"
+    assert s2.combined_spec == "60R4_0603_1"
 
     # 3. Crystal with ±10ppm must NOT extract %10
     s3 = parse_specs(
@@ -142,16 +173,7 @@ def test_edge_cases_from_real_boms():
     assert s4.combined_package == "L0805"
     assert s4.combined_spec == "220R_0805"
 
-    # 5. NTC Thermistor (TER* -> R0603, 10k_0603_%1)
-    s5 = parse_specs(
-        canias_code="TERSS21002FB08B-M-P",
-        mpn_raw="M-PLUSTEC(NCP18XH103F03RB)",
-        description="SMD 0603 Package, 10k, %1, 0.1mW, NTC, M-Plustec(Murata)"
-    )
-    assert s5.combined_package == "R0603"
-    assert s5.combined_spec == "10k_0603_%1"
-
-    # 6. Nested parentheses in MPN & LED BIN removal
+    # 5. Nested parentheses in MPN & LED BIN removal
     assert clean_part_number("H010202005308 (SM15B-GHS-TB(LF)(SN))") == "SM15B-GHS-TB(LF)(SN)"
     assert clean_part_number("LA A67F BİN: AA-BB") == "LA A67F"
     assert clean_part_number("M-PLUSTEC(BC807-40,115)") == "BC807-40"

@@ -13,7 +13,7 @@ Supports:
 """
 import re
 import csv
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import List, Dict, Optional, Tuple, Any
 import openpyxl
 from .models import PnPRow
@@ -32,6 +32,51 @@ RESERVED_REFDES_WORDS = {
 
 MIL_TO_MM_RATIO = Decimal("0.0254")
 TOKEN_REGEX = re.compile(r'"[^"]*"|\S+')
+
+
+def format_coord_3dec(val_str: Any) -> str:
+    """
+    Formats a coordinate string to strictly 3 decimal places with dot separator (.000).
+    - 4+ decimals -> quantize to 3 decimals (e.g. '20.5792' -> '20.579', '64.1722618' -> '64.172')
+    - 1-2 decimals -> pad with trailing zeroes (e.g. '29.95' -> '29.950', '6.1' -> '6.100')
+    - integers -> pad with .000 (e.g. '5' -> '5.000', '0' -> '0.000')
+    - handles comma or dot, strips mm/mil units.
+    """
+    if val_str is None:
+        return "0.000"
+    s = str(val_str).strip().replace(",", ".")
+    s = re.sub(r"(?:mm|mil|thou)$", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"[^\d.\-+]", "", s)
+    if not s or s in ("-", "+", "."):
+        return "0.000"
+    try:
+        dec = Decimal(s)
+        dec_3 = dec.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        return f"{dec_3:f}"
+    except (InvalidOperation, ValueError):
+        return s
+
+
+def repair_turkish_excel_coord(raw_val: Any) -> str:
+    """
+    Repairs coordinates corrupted by Turkish Excel thousands-separator interpretation.
+    In tr-TR Excel, '24.776' is converted to integer 24776.
+    If value is an integer or string with no dot and abs(val) >= 1000, divides by 1000
+    and formats to 3 decimal places ('24.776').
+    """
+    if raw_val is None:
+        return "0.000"
+    s = str(raw_val).strip()
+    if "." in s or "," in s:
+        return format_coord_3dec(s)
+    try:
+        val_int = int(s)
+        if abs(val_int) >= 1000:
+            dec = Decimal(val_int) / Decimal(1000)
+            return format_coord_3dec(str(dec))
+        return format_coord_3dec(s)
+    except (ValueError, InvalidOperation):
+        return format_coord_3dec(s)
 
 
 def is_valid_coordinate(val_str: str) -> bool:
@@ -83,75 +128,52 @@ def _infer_unit_from_coordinates(coord_pairs: List[Tuple[str, str]]) -> str:
 
 
 def normalize_decimal_str(val_str: str) -> str:
-    """
-    Cleans coordinate strings: removes trailing zero noise and openpyxl IEEE-754 float artifacts
-    (e.g. 12.065000000000001 -> 12.065) while preserving all real fractional digits without rounding.
-    Ensures dot '.' separator and no scientific notation.
-    """
-    if not val_str:
-        return "0"
-    s = str(val_str).strip().replace(",", ".")
-    # Remove unit text if present (e.g. 29.9500mm -> 29.9500)
-    s = re.sub(r"[^\d.\-+]", "", s)
-    if not s or s in ("-", "+", "."):
-        return "0"
-    try:
-        dec = Decimal(s)
-        norm = f"{dec:f}"
-        # Strip openpyxl IEEE-754 float precision artifacts at the 12th+ decimal place
-        if re.search(r"\.\d+?(?:0{6,}|9{6,})\d+$", norm):
-            dec = dec.quantize(Decimal("0.0000000001"))
-            norm = f"{dec:f}"
-        if "." in norm:
-            norm = norm.rstrip("0").rstrip(".")
-        return norm if norm and norm != "-0" else "0"
-    except InvalidOperation:
-        return s
+    """Formats coordinate string to strictly 3 decimal places (.000)."""
+    return format_coord_3dec(val_str)
 
 
 def convert_mil_to_mm(mil_val_str: str) -> str:
     """
-    Converts mil (thou) to mm with exact Decimal precision. Zero rounding.
-    e.g. 2526.467 mil -> 64.1722618 mm
+    Converts mil (thou) to mm and formats to strictly 3 decimal places (.000).
+    e.g. 2526.467 mil -> 64.172 mm
     """
     s = mil_val_str.strip().replace(",", ".")
     s = re.sub(r"[^\d.\-+]", "", s)
     try:
         dec_mil = Decimal(s)
         dec_mm = dec_mil * MIL_TO_MM_RATIO
-        norm = f"{dec_mm:f}"
-        if "." in norm:
-            norm = norm.rstrip("0").rstrip(".")
-        return norm if norm else "0"
+        return format_coord_3dec(str(dec_mm))
     except InvalidOperation:
-        return mil_val_str
+        return format_coord_3dec(mil_val_str)
 
 
 def clean_angle(angle_val_str: Any) -> str:
     """
     Cleans rotation angle.
-    Handles Cadence Allegro 1000x scale factor (e.g. 270000 -> 270, 180000 -> 180, 90000 -> 90).
-    Preserves decimals without rounding (e.g. 111.34 -> 111.34).
+    Handles Cadence Allegro 1000x scale factor (e.g. 270000 -> 270, 180000 -> 180).
+    Exact integers remain clean integer ('0', '90', '180', '270').
+    Fractional angles are formatted to 3 decimal places (.000, e.g. 111.34 -> 111.340).
     """
     if angle_val_str is None:
         return "0"
     s = str(angle_val_str).strip().replace(",", ".").replace("°", "")
     s = re.sub(r"[^\d.\-+]", "", s)
-    if not s:
+    if not s or s in ("-", "+", "."):
         return "0"
     try:
         val = float(s)
         # Cadence Allegro 1000x angle fix
         if abs(val) > 360 and val % 1000 == 0:
             val = val / 1000.0
-            return f"{int(val)}" if val.is_integer() else f"{val:g}"
         
-        # Check integer
+        # Check integer angle
         if val.is_integer():
-            return f"{int(val)}"
-        dec = Decimal(s)
-        norm = f"{dec:f}".rstrip("0").rstrip(".")
-        return norm
+            norm_deg = int(val) % 360
+            return str(norm_deg)
+
+        # Fractional angle: normalize to 0..360 and format to 3 decimals
+        deg = val % 360.0
+        return format_coord_3dec(str(deg))
     except (ValueError, InvalidOperation):
         return s
 
@@ -405,6 +427,54 @@ def parse_pnp_text(file_path: str, prefix: str = "", unit_override: Optional[str
             header_unit = u
             split_mode = "whitespace"
             break
+
+    if header_idx is None or "designator" not in col_map or "x" not in col_map or "y" not in col_map:
+        # Fallback: Headerless .AOI or CAD file where data begins directly at line 0
+        for sample_line in merged_lines[:5]:
+            s_line = sample_line.strip()
+            if not s_line or s_line.startswith("="):
+                continue
+            
+            # Check tab-delimited headerless .AOI (RefDes \t X \t Y \t Rot \t Layer ...)
+            if "\t" in s_line:
+                sample_toks = [t.strip().strip('"') for t in s_line.split("\t")]
+                if len(sample_toks) >= 3 and is_valid_refdes_row(sample_toks[0], sample_toks[1], sample_toks[2]):
+                    header_idx = -1
+                    col_map = {"designator": 0, "x": 1, "y": 2}
+                    if len(sample_toks) > 3 and is_valid_coordinate(sample_toks[3]):
+                        col_map["rotation"] = 3
+                    if len(sample_toks) > 4:
+                        col_map["layer"] = 4
+                    split_mode = "tab"
+                    break
+
+            # Check CSV headerless
+            if "," in s_line:
+                try:
+                    sample_toks = [t.strip().strip('"') for t in next(csv.reader([s_line]))]
+                    if len(sample_toks) >= 3 and is_valid_refdes_row(sample_toks[0], sample_toks[1], sample_toks[2]):
+                        header_idx = -1
+                        col_map = {"designator": 0, "x": 1, "y": 2}
+                        if len(sample_toks) > 3 and is_valid_coordinate(sample_toks[3]):
+                            col_map["rotation"] = 3
+                        if len(sample_toks) > 4:
+                            col_map["layer"] = 4
+                        split_mode = "csv"
+                        break
+                except Exception:
+                    pass
+
+            # Check whitespace headerless
+            sample_toks = [t.strip().strip('"') for t in TOKEN_REGEX.findall(s_line)]
+            if len(sample_toks) >= 3 and is_valid_refdes_row(sample_toks[0], sample_toks[1], sample_toks[2]):
+                header_idx = -1
+                col_map = {"designator": 0, "x": 1, "y": 2}
+                if len(sample_toks) > 3 and is_valid_coordinate(sample_toks[3]):
+                    col_map["rotation"] = 3
+                if len(sample_toks) > 4:
+                    col_map["layer"] = 4
+                split_mode = "whitespace"
+                break
 
     if header_idx is None or "designator" not in col_map or "x" not in col_map or "y" not in col_map:
         raise ValueError(f"Pick & Place dosyasında gerekli sütunlar (Designator, X, Y) bulunamadı: {file_path}")

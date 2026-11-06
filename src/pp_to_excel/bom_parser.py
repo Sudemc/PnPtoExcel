@@ -11,7 +11,7 @@ Handles:
 """
 import re
 import csv
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple, Set, Any
 import openpyxl
 from .models import BomItem, ParsedSpec
 from .spec_parser import parse_specs
@@ -293,74 +293,150 @@ def load_canias_bom(file_path: str) -> Tuple[List[BomItem], Dict[str, List[str]]
     return merged_items, refdes_to_codes, item_by_code
 
 
-def extract_erp_prefixes(bom_items: List[BomItem]) -> Dict[str, List[str]]:
+def extract_erp_prefixes(bom_items: List[BomItem]) -> Dict[str, Set[str]]:
     """
-    Extracts all multi-board prefixes from BOM designators.
-    e.g. ['FM_C5', 'ST1_R31', 'F2_LED1', 'TR1_C11'] -> {'FM': ['FM_C5'], 'ST1': ['ST1_R31'], 'F2': ['F2_LED1'], 'TR1': ['TR1_C11']}
-    Ignores isolated underscored component names (like 'R_TH1' on a single-board BOM).
+    Extracts all multi-board prefixes and their base designator sets from BOM.
+    e.g. ['FM_C5', 'ST1_R31', 'F2_LED1', 'TR1_C11'] ->
+    {'FM': {'C5'}, 'ST1': {'R31'}, 'F2': {'LED1'}, 'TR1': {'C11'}}
     """
-    all_counts: Dict[str, List[str]] = {}
+    refs_by_prefix: Dict[str, Set[str]] = {}
+    pfx_counts: Dict[str, int] = {}
     total_refs = 0
-    prefixed_refs = 0
 
     for item in bom_items:
         for ref in item.designator_list:
             total_refs += 1
-            m = PREFIXED_REFDES_PATTERN.match(ref)
-            if m:
-                prefixed_refs += 1
-                pfx = m.group(1).upper()
-                all_counts.setdefault(pfx, []).append(ref)
+            if "_" in ref:
+                parts = ref.split("_", 1)
+                pfx = parts[0].strip().upper()
+                base = parts[1].strip().upper()
+                if 2 <= len(pfx) <= 10 and re.match(r"^[A-Za-z]+\d+", base):
+                    refs_by_prefix.setdefault(pfx, set()).add(base)
+                    pfx_counts[pfx] = pfx_counts.get(pfx, 0) + 1
 
-    # A BOM is multi-board if prefixed designators make up at least 15% of total designators,
-    # and each valid board prefix has at least 3 components.
-    if total_refs == 0 or (prefixed_refs / total_refs) < 0.15:
+    if not total_refs:
         return {}
 
-    return {
-        pfx: refs[:5]
-        for pfx, refs in all_counts.items()
-        if len(refs) >= 3
+    # Valid board prefixes appear in multiple components
+    valid_prefixes = {
+        pfx for pfx, bases in refs_by_prefix.items()
+        if len(bases) >= 2 or pfx_counts.get(pfx, 0) >= 2
     }
 
+    # If prefixed designators make up less than 10% of total designators, it's a single-board BOM
+    sum_prefixed = sum(len(refs_by_prefix[p]) for p in valid_prefixes)
+    if (sum_prefixed / max(1, total_refs)) < 0.10:
+        return {}
 
-def suggest_prefix_for_filename(filename: str, detected_prefixes: Optional[Dict[str, List[str]]] = None) -> str:
+    return {pfx: refs_by_prefix[pfx] for pfx in valid_prefixes}
+
+
+def are_top_bot_pair(filenames: List[str]) -> bool:
+    """Checks if a list of 2 files are simply TOP and BOT of the same board."""
+    if len(filenames) != 2:
+        return False
+    norm_stems = []
+    for fn in filenames:
+        stem = re.sub(r"\.[^.]+$", "", fn).upper()
+        # Remove top/bot keywords
+        clean_stem = re.sub(r"\b(?:TOP|BOT|BOTTOM|T|B)\b", "", stem)
+        clean_stem = re.sub(r"[_\-\s]+", "", clean_stem)
+        norm_stems.append(clean_stem)
+    return norm_stems[0] == norm_stems[1] and len(norm_stems[0]) >= 2
+
+
+def resolve_pnp_file_prefix(
+    filename: str,
+    pnp_refs: Set[str],
+    erp_prefixes: Set[str],
+    erp_refs_by_prefix: Dict[str, Set[str]],
+    all_filenames: Optional[List[str]] = None
+) -> str:
     """
-    Suggests a board prefix (e.g. 'ST1', 'FM', 'TR1', 'F2') from a Pick & Place filename.
-    Uses CamelCase acronym extraction (e.g., 'StopTail1' -> 'ST1', 'FogMain' -> 'FM', 'TurnRev2' -> 'TR2')
-    and matches against detected BOM prefixes if available.
+    Intelligently determines the board prefix for a P&P file.
+    - If BOM has NO multi-board prefixes:
+      - If single file or TOP/BOT pair of the same board: returns "" (NO PREFIX).
+      - If multiple different board files: returns clean 2-4 letter acronym from filename.
+    - If BOM HAS multi-board prefixes:
+      - Uses compound word splitting (deka algorithm), acronym matching, and RefDes overlap scoring.
     """
-    base = re.sub(r"\.[^.]+$", "", filename)
-    tokens = [t for t in re.split(r"[\s_\-]+", base) if t]
-    known_pfxs = {k.upper() for k in (detected_prefixes or {}).keys()}
+    all_fns = all_filenames or [filename]
 
-    # 1. Generate CamelCase / uppercase+digit acronyms for each token in filename
-    # e.g. 'StopTail1' -> 'ST1', 'FogMain' -> 'FM', 'Fog2' -> 'F2', 'TurnRev1' -> 'TR1'
-    candidate_acronyms: List[str] = []
-    for tok in tokens:
-        if any(c.islower() for c in tok) and any(c.isupper() for c in tok):
-            acr = "".join(re.findall(r"[A-Z]|\d+", tok))
-            if len(acr) >= 2:
-                candidate_acronyms.append(acr.upper())
-        tok_up = tok.upper()
-        if known_pfxs and tok_up in known_pfxs:
-            return tok_up
+    # 1. If ERP BOM has multi-board prefixes
+    if erp_prefixes:
+        stem = re.sub(r"\.[^.]+$", "", filename)
+        stem_upper = stem.upper()
+        tokens = re.split(r"[_ \-]+", stem)
 
-    if known_pfxs:
-        for acr in candidate_acronyms:
-            if acr in known_pfxs:
-                return acr
-        # Fallback: word-boundary / multi-char prefix match (longest prefix first)
-        fn_up = base.upper()
-        for pfx in sorted(known_pfxs, key=len, reverse=True):
-            if len(pfx) >= 2 and re.search(rf"(?:^|[_\-\s]){re.escape(pfx)}(?:$|[_\-\s])", fn_up):
+        # Step 1: Token & Acronym matching from filename tokens (deka algorithm)
+        # e.g. StopTail1 -> ST1, FogMain -> FM, TurnRev1 -> TR1, Fog2 -> F2
+        for tok in tokens:
+            tok_clean = tok.strip()
+            if not tok_clean:
+                continue
+            tok_upper = tok_clean.upper()
+            if tok_upper in erp_prefixes:
+                return tok_upper
+
+            spaced = re.sub(r"(?i)(FOG|STOP|TAIL|TURN|REV|MAIN|LAMP|UPPER|LOWER|REAR|FRONT|LEFT|RIGHT)", r" \1 ", tok_clean)
+            sub_tokens = [t.strip().upper() for t in re.split(r"[\s_\-]+", spaced) if t.strip()]
+            if sub_tokens:
+                acronym = "".join(
+                    t if t.isdigit() else t[0]
+                    for t in sub_tokens
+                    if t not in ("LEFT", "RIGHT", "LH", "RH", "LOWER", "UPPER", "FRONT", "REAR", "LAMP", "HW", "SW", "PCB", "P&P")
+                ).upper()
+                if acronym in erp_prefixes:
+                    return acronym
+                for pfx in erp_prefixes:
+                    if acronym.startswith(pfx) or pfx == acronym:
+                        return pfx
+
+        # Step 2: Check longest prefix match in filename
+        for pfx in sorted(erp_prefixes, key=len, reverse=True):
+            if re.search(rf"(?:^|[_\-\s]){re.escape(pfx)}(?:$|[_\-\s])", stem_upper):
                 return pfx
+
+        # Step 3: RefDes set overlap fallback
+        if pnp_refs:
+            clean_bases = set()
+            for r in pnp_refs:
+                parts = r.upper().split("_", 1)
+                clean_bases.add(parts[-1])
+
+            best_pfx = None
+            best_overlap = 0
+            for pfx, bases in erp_refs_by_prefix.items():
+                overlap = len(clean_bases & bases)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_pfx = pfx
+
+            if best_pfx and best_overlap >= 3:
+                return best_pfx
+
         return ""
 
-    # Fallback when BOM is not yet loaded: return CamelCase acronym excluding common words
-    ignore_acronyms = {"HW01", "HW02", "HW03", "SW01", "V1", "V2", "V8"}
-    for acr in candidate_acronyms:
-        if acr not in ignore_acronyms and not acr.startswith("HW"):
-            return acr
+    # 2. If ERP BOM has NO prefixes
+    # If single file or TOP/BOT pair of same board -> NO PREFIX!
+    if len(all_fns) <= 1 or are_top_bot_pair(all_fns):
+        return ""
 
+    # If multiple DIFFERENT boards are loaded for a prefixless BOM, derive short acronym to prevent RefDes collision
+    stem = re.sub(r"\.[^.]+$", "", filename)
+    cleaned = re.sub(r"(?i)\b(?:PICK|PLACE|P&P|PCB|ASSY|BOARD|SAMPLE|LOWER|UPPER|HW\d+|SW\d+|V\d+)\b", "", stem).strip()
+    cleaned = re.sub(r"\b\d{4}[-_]\d{2}[-_]\d{2}\b", "", cleaned).strip()
+    spaced = re.sub(r"(?i)(FOG|STOP|TAIL|TURN|REV|MAIN|LAMP|UPPER|LOWER|REAR|FRONT|LEFT|RIGHT)", r" \1 ", cleaned)
+    tokens = [t.strip().upper() for t in re.split(r"[\s_\-]+", spaced) if t.strip()]
+    if tokens:
+        acro = "".join(t if t.isdigit() else t[0] for t in tokens if t not in ("LEFT", "RIGHT", "LH", "RH"))
+        if 2 <= len(acro) <= 8:
+            return acro
     return ""
+
+
+def suggest_prefix_for_filename(filename: str, detected_prefixes: Optional[Dict[str, Any]] = None, all_filenames: Optional[List[str]] = None) -> str:
+    """Compatibility wrapper for suggest_prefix_for_filename."""
+    known_pfxs = set(detected_prefixes.keys()) if isinstance(detected_prefixes, dict) else set()
+    refs_by_pfx = {k: set(v) for k, v in detected_prefixes.items()} if isinstance(detected_prefixes, dict) else {}
+    return resolve_pnp_file_prefix(filename, set(), known_pfxs, refs_by_pfx, all_filenames=all_filenames)

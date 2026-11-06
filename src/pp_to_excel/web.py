@@ -1,5 +1,8 @@
 """
-FastAPI web application for Pick & Place to Excel/AOI Automation & Canias BOM Validation.
+FastAPI web application for:
+- Module 1: SMT Pick & Place to Excel/AOI Automation
+- Module 2: Prepared Excel / .AOI vs Canias BOM Verification
+- Module 3: Customer Raw P&P vs Prepared .AOI / Excel Verification
 """
 from __future__ import annotations
 
@@ -11,17 +14,18 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from .bom_parser import load_canias_bom, extract_erp_prefixes, suggest_prefix_for_filename
+from .bom_parser import load_canias_bom, extract_erp_prefixes, resolve_pnp_file_prefix, suggest_prefix_for_filename
 from .pnp_parser import load_pnp_file
 from .matcher_pipeline import run_matching_pipeline
 from .validator_engine import validate_prepared_excel_against_bom
+from .pnp_verifier import verify_pnp_against_prepared, export_pnp_verification_report
 from .exporter import (
     export_final_excel,
     export_aoi_file,
@@ -68,18 +72,21 @@ async def analyze_bom(bom_file: UploadFile = File(...)):
     Parses uploaded Canias BOM and returns component statistics and detected prefixes.
     """
     temp_dir = tempfile.mkdtemp()
-    bom_path = os.path.join(temp_dir, bom_file.filename)
+    bom_path = os.path.join(temp_dir, bom_file.filename or "bom.xlsx")
     try:
         with open(bom_path, "wb") as f:
             f.write(await bom_file.read())
 
         items, ref_map, item_by_code = load_canias_bom(bom_path)
-        prefixes = extract_erp_prefixes(items)
+        refs_by_pfx = extract_erp_prefixes(items)
+        valid_prefixes = set(refs_by_pfx.keys())
 
         smd_items = [i for i in items if i.is_smd]
         non_smd_items = [i for i in items if not i.is_smd]
 
         total_smd_refs = sum(len(i.designator_list) for i in smd_items)
+
+        pfx_dict = {p: list(refs_by_pfx.get(p, set()))[:5] for p in valid_prefixes}
 
         return {
             "success": True,
@@ -88,7 +95,7 @@ async def analyze_bom(bom_file: UploadFile = File(...)):
             "smd_item_count": len(smd_items),
             "smd_ref_count": total_smd_refs,
             "non_smd_count": len(non_smd_items),
-            "detected_prefixes": prefixes,
+            "detected_prefixes": pfx_dict,
             "non_smd_samples": [{"canias_code": i.canias_code, "reason": i.skip_reason, "desc": i.description} for i in non_smd_items[:10]]
         }
     except Exception as e:
@@ -121,13 +128,16 @@ async def generate_pipeline(
             f.write(await bom_file.read())
 
         bom_items, ref_map, item_by_code = load_canias_bom(bom_path)
-        detected_prefixes = extract_erp_prefixes(bom_items)
+        refs_by_pfx = extract_erp_prefixes(bom_items)
+        valid_prefixes = set(refs_by_pfx.keys())
 
         prefix_mapping = {}
         try:
             prefix_mapping = json.loads(prefixes_json)
         except Exception:
             pass
+
+        all_orig_names = [pf.filename or f"pnp_{idx}.txt" for idx, pf in enumerate(pnp_files)]
 
         # Parse all P&P files
         all_pnp_rows = []
@@ -140,12 +150,10 @@ async def generate_pipeline(
             with open(pf_path, "wb") as f:
                 f.write(await pf.read())
 
-            if orig_name in prefix_mapping:
-                pfx = prefix_mapping[orig_name]
-            elif detected_prefixes:
-                pfx = suggest_prefix_for_filename(orig_name, detected_prefixes)
+            if orig_name in prefix_mapping and prefix_mapping[orig_name] is not None:
+                pfx = prefix_mapping[orig_name].strip()
             else:
-                pfx = ""
+                pfx = resolve_pnp_file_prefix(orig_name, set(), valid_prefixes, refs_by_pfx, all_filenames=all_orig_names)
 
             rows = load_pnp_file(pf_path, prefix=pfx)
             all_pnp_rows.extend(rows)
@@ -225,12 +233,12 @@ async def generate_pipeline(
 
 @app.post("/api/validate")
 async def validate_excel(
-    excel_file: UploadFile = File(...),
     bom_file: UploadFile = File(...),
+    excel_files: List[UploadFile] = File(...),
     project_name: str = Form("Proje")
 ):
     """
-    Module 2: Validates a prepared final Excel file against the current Canias ERP BOM.
+    Module 2: Validates prepared Excel / .AOI file(s) against the current Canias ERP BOM.
     """
     _cleanup_expired_jobs()
     temp_dir = tempfile.mkdtemp()
@@ -238,20 +246,24 @@ async def validate_excel(
 
     try:
         # Save BOM
-        bom_path = os.path.join(temp_dir, bom_file.filename)
+        bom_path = os.path.join(temp_dir, bom_file.filename or "bom.xlsx")
         with open(bom_path, "wb") as f:
             f.write(await bom_file.read())
 
         bom_items, ref_map, item_by_code = load_canias_bom(bom_path)
 
-        # Save prepared Excel
-        excel_path = os.path.join(temp_dir, excel_file.filename)
-        with open(excel_path, "wb") as f:
-            f.write(await excel_file.read())
+        # Save prepared files (.xlsx, .AOI, .txt, .csv)
+        saved_prep_paths = []
+        for idx, ef in enumerate(excel_files):
+            ef_safe_name = f"{idx}_{os.path.basename(ef.filename or 'prep.xlsx')}"
+            ef_path = os.path.join(temp_dir, ef_safe_name)
+            with open(ef_path, "wb") as f:
+                f.write(await ef.read())
+            saved_prep_paths.append(ef_path)
 
         # Run validation
         summary, repaired_top, repaired_bottom = validate_prepared_excel_against_bom(
-            excel_path, bom_items, ref_map, item_by_code
+            saved_prep_paths, bom_items, ref_map, item_by_code
         )
 
         safe_proj = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project_name) or "Proje"
@@ -316,6 +328,103 @@ async def validate_excel(
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=f"Karşılaştırma hatası: {str(e)}")
+
+
+@app.post("/api/verify-pnp")
+async def verify_pnp_endpoint(
+    customer_pnp_files: List[UploadFile] = File(...),
+    prepared_files: List[UploadFile] = File(...),
+    bom_file: Optional[UploadFile] = File(None),
+    project_name: str = Form("PnP_Dogrulama")
+):
+    """
+    Module 3: Compares Customer Raw P&P file(s) against Our Prepared .AOI / Final Excel file(s).
+    """
+    _cleanup_expired_jobs()
+    temp_dir = tempfile.mkdtemp()
+    job_id = str(uuid4())
+
+    try:
+        # Save BOM if provided
+        bom_path = None
+        if bom_file and bom_file.filename:
+            bom_path = os.path.join(temp_dir, os.path.basename(bom_file.filename))
+            with open(bom_path, "wb") as f:
+                f.write(await bom_file.read())
+
+        # Save customer P&P files
+        saved_cust_paths = []
+        for idx, cf in enumerate(customer_pnp_files):
+            cf_safe = f"cust_{idx}_{os.path.basename(cf.filename or 'pnp.txt')}"
+            cf_path = os.path.join(temp_dir, cf_safe)
+            with open(cf_path, "wb") as f:
+                f.write(await cf.read())
+            saved_cust_paths.append(cf_path)
+
+        # Save prepared files
+        saved_prep_paths = []
+        for idx, pf in enumerate(prepared_files):
+            pf_safe = f"prep_{idx}_{os.path.basename(pf.filename or 'prep.xlsx')}"
+            pf_path = os.path.join(temp_dir, pf_safe)
+            with open(pf_path, "wb") as f:
+                f.write(await pf.read())
+            saved_prep_paths.append(pf_path)
+
+        # Execute verification
+        summary = verify_pnp_against_prepared(
+            customer_pnp_paths=saved_cust_paths,
+            prepared_paths=saved_prep_paths,
+            bom_path=bom_path
+        )
+
+        safe_proj = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in project_name) or "PnP_Dogrulama"
+        report_path = os.path.join(temp_dir, f"{safe_proj}_Musteri_PnP_Karsilastirma_Raporu.xlsx")
+        export_pnp_verification_report(summary, report_path, safe_proj)
+
+        with _jobs_lock:
+            _jobs[job_id] = {
+                "created_at": datetime.now(timezone.utc),
+                "temp_dir": temp_dir,
+                "files": {
+                    "pnp_verification_report": report_path
+                }
+            }
+
+        diffs_data = [
+            {
+                "status": d.status,
+                "side": d.side,
+                "refdes": d.refdes,
+                "category": d.category,
+                "detail": d.detail,
+                "cust_val": d.customer_value,
+                "prep_val": d.prepared_value,
+                "file": os.path.basename(d.customer_file) if d.customer_file else ""
+            }
+            for d in summary.differences
+        ]
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "project_name": safe_proj,
+            "summary": {
+                "total_customer": summary.total_customer_components,
+                "total_prepared": summary.total_prepared_components,
+                "match_count": summary.match_count,
+                "coord_error_count": summary.coord_error_count,
+                "angle_error_count": summary.angle_error_count,
+                "layer_error_count": summary.layer_error_count,
+                "missing_in_prepared": summary.missing_in_prepared_count,
+                "extra_in_prepared": summary.extra_in_prepared_count,
+                "skipped_non_smd": summary.skipped_non_smd_count,
+                "accuracy_percent": summary.accuracy_percent
+            },
+            "differences": diffs_data
+        }
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"P&P Doğrulama hatası: {str(e)}")
 
 
 @app.get("/api/download/{job_id}/{file_type}")
