@@ -366,18 +366,29 @@ def resolve_pnp_file_prefix(
     if erp_prefixes:
         stem = re.sub(r"\.[^.]+$", "", filename)
         stem_upper = stem.upper()
-        tokens = re.split(r"[_ \-]+", stem)
+        tokens = [t.strip() for t in re.split(r"[_ \-]+", stem) if t.strip()]
+        tokens_upper = [t.upper() for t in tokens]
+
+        # Direct exact match of any token against erp_prefixes (e.g. 'ST1L', 'FM')
+        for tok_u in tokens_upper:
+            if tok_u in erp_prefixes:
+                return tok_u
+
+        # Detect Left / Right indicator in filename if prefixes have L/R variants
+        has_l_in_pfx = any(p.endswith("L") for p in erp_prefixes)
+        has_r_in_pfx = any(p.endswith("R") for p in erp_prefixes)
+        file_side = None
+        if has_l_in_pfx and any(t in ("LEFT", "LH", "SOL", "L") for t in tokens_upper):
+            file_side = "L"
+        elif has_r_in_pfx and any(t in ("RIGHT", "RH", "SAG", "SAĞ", "R") for t in tokens_upper):
+            file_side = "R"
 
         # Step 1: Token & Acronym matching from filename tokens (deka algorithm)
-        # e.g. StopTail1 -> ST1, FogMain -> FM, TurnRev1 -> TR1, Fog2 -> F2
+        # e.g. StopTail1 -> ST1 (+ L -> ST1L), FogMain -> FM, TurnRev1 -> TR1
         for tok in tokens:
             tok_clean = tok.strip()
             if not tok_clean:
                 continue
-            tok_upper = tok_clean.upper()
-            if tok_upper in erp_prefixes:
-                return tok_upper
-
             spaced = re.sub(r"(?i)(FOG|STOP|TAIL|TURN|REV|MAIN|LAMP|UPPER|LOWER|REAR|FRONT|LEFT|RIGHT)", r" \1 ", tok_clean)
             sub_tokens = [t.strip().upper() for t in re.split(r"[\s_\-]+", spaced) if t.strip()]
             if sub_tokens:
@@ -386,6 +397,15 @@ def resolve_pnp_file_prefix(
                     for t in sub_tokens
                     if t not in ("LEFT", "RIGHT", "LH", "RH", "LOWER", "UPPER", "FRONT", "REAR", "LAMP", "HW", "SW", "PCB", "P&P")
                 ).upper()
+                if not acronym:
+                    continue
+
+                # If file_side is detected and acronym + file_side exists in prefixes (e.g. ST1 + L -> ST1L)
+                if file_side:
+                    side_cand = acronym + file_side
+                    if side_cand in erp_prefixes:
+                        return side_cand
+
                 if acronym in erp_prefixes:
                     return acronym
                 for pfx in erp_prefixes:

@@ -102,7 +102,11 @@ def read_prepared_file(file_path: str) -> List[Dict[str, Any]]:
     if not lines:
         return []
 
-    default_side = "Bottom" if "bot" in base_name else "Top"
+    default_side = "Bottom" if (
+        "bot" in base_name
+        or "bottom" in base_name
+        or re.search(r"[_\-]b(?:[_\.\-]|$)|\.b\.", base_name)
+    ) else "Top"
     start_line = 0
 
     # Check if line 0 is a header
@@ -142,10 +146,13 @@ def read_prepared_file(file_path: str) -> List[Dict[str, Any]]:
         if not refdes:
             continue
 
-        side = default_side
-        if "bot" in layer.lower() or layer.upper() == "B":
+        # In AOI / SMT outputs, Column E is often forced to 'T' for both sides.
+        # If the file itself is a designated Bottom file (_B_ or _BOT), preserve side as Bottom!
+        if default_side == "Bottom":
             side = "Bottom"
-        elif "top" in layer.lower() or layer.upper() in ("T", "TOP"):
+        elif "bot" in layer.lower() or layer.upper() == "B":
+            side = "Bottom"
+        else:
             side = "Top"
 
         parsed_rows.append({
