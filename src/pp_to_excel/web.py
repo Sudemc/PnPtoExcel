@@ -150,12 +150,22 @@ async def generate_pipeline(
             with open(pf_path, "wb") as f:
                 f.write(await pf.read())
 
-            if orig_name in prefix_mapping and prefix_mapping[orig_name] is not None:
-                pfx = prefix_mapping[orig_name].strip()
-            else:
-                pfx = resolve_pnp_file_prefix(orig_name, set(), valid_prefixes, refs_by_pfx, all_filenames=all_orig_names)
+            raw_rows = load_pnp_file(pf_path, prefix="")
+            pnp_refs = {r.raw_designator for r in raw_rows}
 
-            rows = load_pnp_file(pf_path, prefix=pfx)
+            user_pfx = str(prefix_mapping.get(orig_name) or "").strip()
+            if user_pfx:
+                pfx = user_pfx
+            else:
+                pfx = resolve_pnp_file_prefix(orig_name, pnp_refs, valid_prefixes, refs_by_pfx, all_filenames=all_orig_names)
+
+            if pfx:
+                clean_pfx = pfx.strip().rstrip("_")
+                for r in raw_rows:
+                    r.prefix = pfx
+                    if not r.raw_designator.upper().startswith(f"{clean_pfx.upper()}_"):
+                        r.designator = f"{clean_pfx}_{r.raw_designator}"
+            rows = raw_rows
             all_pnp_rows.extend(rows)
             parsed_files_info.append({
                 "filename": orig_name,

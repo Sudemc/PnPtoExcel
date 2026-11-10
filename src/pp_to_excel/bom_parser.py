@@ -9,6 +9,7 @@ Handles:
 - Board prefix detection (_extract_erp_prefixes) for multi-board panels.
 - Parameter enrichment via spec_parser.
 """
+import os
 import re
 import csv
 from typing import List, Dict, Optional, Tuple, Set, Any
@@ -331,13 +332,20 @@ def extract_erp_prefixes(bom_items: List[BomItem]) -> Dict[str, Set[str]]:
     return {pfx: refs_by_prefix[pfx] for pfx in valid_prefixes}
 
 
+def _clean_filename_stem(filename: str) -> str:
+    """Extracts filename stem, stripping directory paths and temporary upload prefixes (e.g. cust_0_, prep_1_, 0_)."""
+    base = os.path.basename(filename or "")
+    base = re.sub(r"^(?:cust_\d+_|prep_\d+_|\d+_)", "", base, flags=re.IGNORECASE)
+    return re.sub(r"\.[^.]+$", "", base)
+
+
 def are_top_bot_pair(filenames: List[str]) -> bool:
     """Checks if a list of 2 files are simply TOP and BOT of the same board."""
     if len(filenames) != 2:
         return False
     norm_stems = []
     for fn in filenames:
-        stem = re.sub(r"\.[^.]+$", "", fn).upper()
+        stem = _clean_filename_stem(fn).upper()
         # Remove top/bot keywords
         clean_stem = re.sub(r"\b(?:TOP|BOT|BOTTOM|T|B)\b", "", stem)
         clean_stem = re.sub(r"[_\-\s]+", "", clean_stem)
@@ -358,14 +366,14 @@ def resolve_pnp_file_prefix(
       - If single file or TOP/BOT pair of the same board: returns "" (NO PREFIX).
       - If multiple different board files: returns clean 2-4 letter acronym from filename.
     - If BOM HAS multi-board prefixes:
-      - Uses compound word splitting (deka algorithm), acronym matching, and RefDes overlap scoring.
+      - Uses compound word splitting (deka algorithm), L/R side detection, acronym matching, and RefDes overlap scoring.
     """
     all_fns = all_filenames or [filename]
+    stem = _clean_filename_stem(filename)
+    stem_upper = stem.upper()
 
     # 1. If ERP BOM has multi-board prefixes
     if erp_prefixes:
-        stem = re.sub(r"\.[^.]+$", "", filename)
-        stem_upper = stem.upper()
         tokens = [t.strip() for t in re.split(r"[_ \-]+", stem) if t.strip()]
         tokens_upper = [t.upper() for t in tokens]
 
@@ -408,6 +416,13 @@ def resolve_pnp_file_prefix(
 
                 if acronym in erp_prefixes:
                     return acronym
+
+                # If filename is un-sided (e.g. StopTail1.xlsx) and BOM has ST1L / ST1R
+                if f"{acronym}L" in erp_prefixes:
+                    return f"{acronym}L"
+                if f"{acronym}R" in erp_prefixes:
+                    return f"{acronym}R"
+
                 for pfx in erp_prefixes:
                     if acronym.startswith(pfx) or pfx == acronym:
                         return pfx
@@ -426,13 +441,16 @@ def resolve_pnp_file_prefix(
 
             best_pfx = None
             best_overlap = 0
-            for pfx, bases in erp_refs_by_prefix.items():
+            for pfx in sorted(erp_prefixes):
+                bases = erp_refs_by_prefix.get(pfx, set())
                 overlap = len(clean_bases & bases)
-                if overlap > best_overlap:
+                if overlap > best_overlap or (
+                    overlap == best_overlap and overlap > 0 and file_side and pfx.endswith(file_side)
+                ):
                     best_overlap = overlap
                     best_pfx = pfx
 
-            if best_pfx and best_overlap >= 3:
+            if best_pfx and best_overlap >= 2:
                 return best_pfx
 
         return ""
@@ -443,7 +461,6 @@ def resolve_pnp_file_prefix(
         return ""
 
     # If multiple DIFFERENT boards are loaded for a prefixless BOM, derive short acronym to prevent RefDes collision
-    stem = re.sub(r"\.[^.]+$", "", filename)
     cleaned = re.sub(r"(?i)\b(?:PICK|PLACE|P&P|PCB|ASSY|BOARD|SAMPLE|LOWER|UPPER|HW\d+|SW\d+|V\d+)\b", "", stem).strip()
     cleaned = re.sub(r"\b\d{4}[-_]\d{2}[-_]\d{2}\b", "", cleaned).strip()
     spaced = re.sub(r"(?i)(FOG|STOP|TAIL|TURN|REV|MAIN|LAMP|UPPER|LOWER|REAR|FRONT|LEFT|RIGHT)", r" \1 ", cleaned)
@@ -453,6 +470,91 @@ def resolve_pnp_file_prefix(
         if 2 <= len(acro) <= 8:
             return acro
     return ""
+
+
+def lookup_refdes_in_bom(
+    ref_upper: str,
+    refdes_to_codes: Dict[str, List[str]],
+    item_by_code: Optional[Dict[str, BomItem]] = None
+) -> Tuple[Optional[List[str]], Set[str]]:
+    """
+    Looks up a component designator in Canias BOM with full Left/Right (L/R) and multi-board equivalence:
+    1. Exact match (e.g. 'ST1L_C1' -> 'ST1L_C1')
+    2. Prefix-stripped base match for single-board BOMs ('ST1_C1' -> 'C1')
+    3. L/R-stripped prefix match ('ST1L_C1' or 'ST1R_C1' -> 'ST1_C1' when BOM has un-sided 'ST1_C1')
+    4. L/R-expanded prefix match ('ST1_C1' -> 'ST1L_C1' & 'ST1R_C1' when BOM has L/R prefixes)
+    5. Symmetrical L/R twin fallback ('T2R_LED1' <-> 'T2L_LED1' when BOM has L/R typo like 'T2L_LED1, T2R_LED2')
+    Returns (canias_codes, matched_bom_keys_set).
+    """
+    ref_u = ref_upper.strip().upper()
+    if not ref_u:
+        return None, set()
+
+    # 1. Exact match
+    codes = refdes_to_codes.get(ref_u)
+    if codes:
+        matched_keys = {ref_u}
+        # If this is <PFX>L_<BASE> or <PFX>R_<BASE>, check if un-sided <PFX>_<BASE> also exists
+        if "_" in ref_u:
+            pfx, base = ref_u.split("_", 1)
+            if pfx.endswith(("L", "R")) and len(pfx) >= 3:
+                matched_keys.add(f"{pfx[:-1]}_{base}")
+        return codes, matched_keys
+
+    if "_" in ref_u:
+        pfx, base = ref_u.split("_", 1)
+
+        # 2. Prefix-stripped base match (for single-board BOMs without prefixes)
+        codes = refdes_to_codes.get(base)
+        if codes:
+            return codes, {ref_u, base}
+
+        # 3. L/R-stripped prefix match: <PFX>L_<BASE> or <PFX>R_<BASE> -> <PFX>_<BASE>
+        if pfx.endswith(("L", "R")) and len(pfx) >= 3:
+            base_pfx = pfx[:-1].rstrip("_")
+            cand_unsided = f"{base_pfx}_{base}"
+            codes = refdes_to_codes.get(cand_unsided)
+            if codes:
+                return codes, {ref_u, cand_unsided}
+
+        # 4. L/R-expanded prefix match: <PFX>_<BASE> -> <PFX>L_<BASE> & <PFX>R_<BASE>
+        cand_l = f"{pfx}L_{base}"
+        cand_r = f"{pfx}R_{base}"
+        codes_l = refdes_to_codes.get(cand_l)
+        codes_r = refdes_to_codes.get(cand_r)
+        if codes_l or codes_r:
+            return (codes_l or codes_r), {ref_u, cand_l, cand_r}
+
+        # 5. Symmetrical L/R twin fallback: <PFX>R_<BASE> <-> <PFX>L_<BASE>
+        # Handles cases where the same part is on Left & Right boards (e.g. T2L_LED1 & T2R_LED1)
+        # and ERP BOM wrote T2L_LED1, T2R_LED2 (typo on one side's index) or only listed one side.
+        if pfx.endswith(("L", "R")) and len(pfx) >= 3:
+            twin_side = "L" if pfx.endswith("R") else "R"
+            twin_pfx = pfx[:-1] + twin_side
+            twin_ref = f"{twin_pfx}_{base}"
+            twin_codes = refdes_to_codes.get(twin_ref)
+            if twin_codes:
+                matched_keys = {ref_u, twin_ref}
+                if item_by_code and twin_codes[0] in item_by_code:
+                    b_item = item_by_code[twin_codes[0]]
+                    m_cls = re.match(r"^([A-Z]+)\d+$", base)
+                    if m_cls:
+                        comp_cls = m_cls.group(1)
+                        for d in b_item.designator_list:
+                            d_up = d.upper()
+                            if d_up.startswith(f"{pfx}_{comp_cls}"):
+                                matched_keys.add(d_up)
+                return twin_codes, matched_keys
+    else:
+        # Unprefixed ref_u (e.g. 'B1'), check if BOM only has single L/R pair like '<PFX>L_B1', '<PFX>R_B1'
+        matching_lr = [k for k in refdes_to_codes if k.endswith(f"_{ref_u}")]
+        if len(matching_lr) == 2:
+            p0 = matching_lr[0].split("_", 1)[0]
+            p1 = matching_lr[1].split("_", 1)[0]
+            if len(p0) == len(p1) and p0[:-1] == p1[:-1] and {p0[-1], p1[-1]} == {"L", "R"}:
+                return refdes_to_codes[matching_lr[0]], {ref_u, matching_lr[0], matching_lr[1]}
+
+    return None, set()
 
 
 def suggest_prefix_for_filename(filename: str, detected_prefixes: Optional[Dict[str, Any]] = None, all_filenames: Optional[List[str]] = None) -> str:

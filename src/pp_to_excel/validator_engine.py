@@ -17,15 +17,116 @@ import openpyxl
 from .models import (
     BomItem, MatchedRow, ValidationDifference, ValidationSummary
 )
+from .bom_parser import lookup_refdes_in_bom
 from .spec_parser import are_specs_semantically_equivalent, parse_specs
 from .matcher_pipeline import natural_sort_key
-from .pnp_parser import format_coord_3dec, repair_turkish_excel_coord, clean_angle
+from .pnp_parser import (
+    format_coord_3dec,
+    repair_turkish_excel_coord,
+    clean_angle,
+    is_valid_refdes_row,
+    is_valid_coordinate,
+    find_column_indices,
+    normalize_layer,
+    _cell_str,
+)
+
+
+def _is_bottom_name(name: str) -> bool:
+    """Checks if a sheet name or filename indicates Bottom side."""
+    low = name.lower()
+    return (
+        "bot" in low
+        or "bottom" in low
+        or bool(re.search(r"(?:^|[_\-\s])b(?:[_\.\-\s]|$)|\.b\.", low))
+    )
+
+
+def _is_top_name(name: str) -> bool:
+    """Checks if a sheet name or filename indicates Top side."""
+    low = name.lower()
+    return (
+        "top" in low
+        or bool(re.search(r"(?:^|[_\-\s])t(?:[_\.\-\s]|$)|\.t\.", low))
+    )
+
+
+def _unpack_prepared_columns(col_vals: List[str]) -> Tuple[str, str, str, str, str, str]:
+    """
+    Auto-detects 7-column format (Layer 'T' omitted: Pkg, Spec, Code, Barcode, Desc)
+    vs 8-10 column format (Layer, Pkg, Spec, Code, Barcode, Desc).
+    Returns (layer, pkg, spec, code, barcode, desc).
+    """
+    padded = (col_vals + ["", "", "", "", "", ""])[:6]
+    c4_up = padded[0].strip().upper()
+    is_layer_col = (
+        c4_up in ("T", "B", "TOP", "BOT", "BOTTOM", "TOPLAYER", "BOTTOMLAYER")
+        or (c4_up == "" and padded[3].strip() != "")
+    )
+    if is_layer_col:
+        return (
+            padded[0].strip() or "T",
+            padded[1].strip(),
+            padded[2].strip(),
+            padded[3].strip(),
+            padded[4].strip(),
+            padded[5].strip(),
+        )
+    else:
+        return (
+            "T",
+            padded[0].strip(),
+            padded[1].strip(),
+            padded[2].strip(),
+            padded[3].strip(),
+            padded[4].strip(),
+        )
+
+
+def _extract_workbook_ref_sides(wb: openpyxl.Workbook) -> Dict[str, str]:
+    """
+    Extracts a mapping of RefDes -> 'Top' / 'Bottom' from any raw CAD sheet
+    (e.g. 'Pick&Place', 'Sheet1') or scratch sheet in the same workbook,
+    so generic prepared sheets ('Sayfa1', 'Sayfa2', 'Sayfa4') with forced Layer='T'
+    still get accurate Top/Bottom side classification.
+    """
+    ref_side_map: Dict[str, str] = {}
+    for sname in wb.sheetnames:
+        ws = wb[sname]
+        # 1. Check headed CAD P&P sheets
+        header_row = None
+        col_map = {}
+        for r in range(1, min(ws.max_row + 1, 25)):
+            row_vals = [_cell_str(ws.cell(r, c).value) for c in range(1, min(ws.max_column + 1, 15))]
+            cm, _ = find_column_indices(row_vals)
+            if "designator" in cm and "layer" in cm and "x" in cm:
+                header_row = r
+                col_map = cm
+                break
+        if header_row is not None:
+            d_col = col_map["designator"] + 1
+            l_col = col_map["layer"] + 1
+            for r in range(header_row + 1, ws.max_row + 1):
+                d_val = _cell_str(ws.cell(r, d_col).value).upper()
+                l_val = _cell_str(ws.cell(r, l_col).value)
+                if d_val and l_val:
+                    ref_side_map[d_val] = normalize_layer(l_val)
+            continue
+
+        # 2. Check headerless scratch sheets where Col 1 is RefDes and Col 2 is 'Top'/'Bottom'
+        for r in range(1, ws.max_row + 1):
+            c1 = _cell_str(ws.cell(r, 1).value).upper()
+            c2 = _cell_str(ws.cell(r, 2).value).upper()
+            if c1 and c2 in ("TOP", "BOTTOM", "TOPLAYER", "BOTTOMLAYER"):
+                ref_side_map[c1] = normalize_layer(c2)
+    return ref_side_map
 
 
 def read_prepared_file(file_path: str) -> List[Dict[str, Any]]:
     """
     Reads an engineer-prepared Pick & Place file (.xlsx, .AOI, .txt, .csv).
-    Handles both headed and headerless formats.
+    Handles both headed and headerless formats, 7-column and 8-10 column layouts,
+    and multi-sheet Excel workbooks ('Sayfa1', 'Sayfa2', 'Sayfa4', 'TOP', 'BOT').
     Automatically repairs Turkish Excel thousands-separator corruption (24776 -> 24.776).
     """
     parsed_rows: List[Dict[str, Any]] = []
@@ -34,40 +135,82 @@ def read_prepared_file(file_path: str) -> List[Dict[str, Any]]:
 
     if fp_low.endswith(".xlsx"):
         wb = openpyxl.load_workbook(file_path, data_only=True)
-        target_sheets = []
+        workbook_ref_sides = _extract_workbook_ref_sides(wb)
+        file_default_side = "Bottom" if _is_bottom_name(base_name) else "Top"
+
+        # Scan all sheets in the workbook to find prepared production tables
+        candidate_sheets: List[str] = []
         for sname in wb.sheetnames:
-            low = sname.lower()
-            if "top" in low:
-                target_sheets.append((sname, "Top"))
-            elif "bot" in low:
-                target_sheets.append((sname, "Bottom"))
-
-        if not target_sheets:
-            target_sheets = [(wb.active.title, "Bottom" if "bot" in base_name else "Top")]
-
-        for sname, side in target_sheets:
             sheet = wb[sname]
             start_row = 1
-            
-            # Check if row 1 is a header
-            first_row_vals = [str(sheet.cell(1, c).value or "").strip().lower() for c in range(1, min(sheet.max_column + 1, 11))]
+            first_row_vals = [_cell_str(sheet.cell(1, c).value).lower() for c in range(1, min(sheet.max_column + 1, 11))]
             if any(h in first_row_vals for h in ("designator", "refdes", "yerleşim yeri", "ref", "center-x", "katman", "layer")):
                 start_row = 2
 
+            valid_prep_rows = 0
+            for r in range(start_row, min(sheet.max_row + 1, start_row + 40)):
+                refdes = _cell_str(sheet.cell(r, 1).value)
+                raw_x = _cell_str(sheet.cell(r, 2).value)
+                raw_y = _cell_str(sheet.cell(r, 3).value)
+                raw_rot = _cell_str(sheet.cell(r, 4).value)
+                extra_cols = [_cell_str(sheet.cell(r, c).value) for c in range(5, 11)]
+                _, pkg, spec, code, _, _ = _unpack_prepared_columns(extra_cols)
+                if (
+                    is_valid_refdes_row(refdes, raw_x, raw_y)
+                    and (not raw_rot or is_valid_coordinate(raw_rot))
+                    and (code or spec or pkg)
+                ):
+                    valid_prep_rows += 1
+            if valid_prep_rows > 0:
+                candidate_sheets.append(sname)
+
+        if not candidate_sheets:
+            for sname in wb.sheetnames:
+                low = sname.lower()
+                if "top" in low or "bot" in low:
+                    candidate_sheets.append(sname)
+        if not candidate_sheets:
+            candidate_sheets = [wb.active.title]
+
+        for sname in candidate_sheets:
+            sheet = wb[sname]
+            start_row = 1
+            first_row_vals = [_cell_str(sheet.cell(1, c).value).lower() for c in range(1, min(sheet.max_column + 1, 11))]
+            if any(h in first_row_vals for h in ("designator", "refdes", "yerleşim yeri", "ref", "center-x", "katman", "layer")):
+                start_row = 2
+
+            sheet_explicit_side = None
+            if _is_bottom_name(sname):
+                sheet_explicit_side = "Bottom"
+            elif _is_top_name(sname):
+                sheet_explicit_side = "Top"
+
             for r in range(start_row, sheet.max_row + 1):
-                refdes = str(sheet.cell(r, 1).value or "").strip()
+                refdes = _cell_str(sheet.cell(r, 1).value)
                 raw_x = sheet.cell(r, 2).value
                 raw_y = sheet.cell(r, 3).value
                 raw_rot = sheet.cell(r, 4).value
-                layer = str(sheet.cell(r, 5).value or "").strip()
-                pkg = str(sheet.cell(r, 6).value or "").strip()
-                spec = str(sheet.cell(r, 7).value or "").strip()
-                code = str(sheet.cell(r, 8).value or "").strip()
-                barcode = str(sheet.cell(r, 9).value or "").strip()
-                desc = str(sheet.cell(r, 10).value or "").strip()
+                extra_cols = [_cell_str(sheet.cell(r, c).value) for c in range(5, 11)]
+                layer, pkg, spec, code, barcode, desc = _unpack_prepared_columns(extra_cols)
 
                 if not refdes and not code and not spec:
                     continue
+                if not is_valid_refdes_row(refdes, _cell_str(raw_x), _cell_str(raw_y)):
+                    continue
+
+                ref_u = refdes.upper()
+                base_u = ref_u.split("_", 1)[1] if "_" in ref_u else ref_u
+
+                if sheet_explicit_side:
+                    side = sheet_explicit_side
+                elif ref_u in workbook_ref_sides:
+                    side = workbook_ref_sides[ref_u]
+                elif base_u in workbook_ref_sides:
+                    side = workbook_ref_sides[base_u]
+                elif "bot" in layer.lower() or layer.upper() == "B":
+                    side = "Bottom"
+                else:
+                    side = file_default_side
 
                 parsed_rows.append({
                     "source_file": file_path,
@@ -102,11 +245,7 @@ def read_prepared_file(file_path: str) -> List[Dict[str, Any]]:
     if not lines:
         return []
 
-    default_side = "Bottom" if (
-        "bot" in base_name
-        or "bottom" in base_name
-        or re.search(r"[_\-]b(?:[_\.\-]|$)|\.b\.", base_name)
-    ) else "Top"
+    default_side = "Bottom" if _is_bottom_name(base_name) else "Top"
     start_line = 0
 
     # Check if line 0 is a header
@@ -136,12 +275,8 @@ def read_prepared_file(file_path: str) -> List[Dict[str, Any]]:
         raw_x = tokens[1] if len(tokens) > 1 else "0"
         raw_y = tokens[2] if len(tokens) > 2 else "0"
         raw_rot = tokens[3] if len(tokens) > 3 else "0"
-        layer = tokens[4] if len(tokens) > 4 else "T"
-        pkg = tokens[5] if len(tokens) > 5 else ""
-        spec = tokens[6] if len(tokens) > 6 else ""
-        code = tokens[7] if len(tokens) > 7 else ""
-        barcode = tokens[8] if len(tokens) > 8 else ""
-        desc = tokens[9] if len(tokens) > 9 else ""
+        extra_cols = tokens[4:10]
+        layer, pkg, spec, code, barcode, desc = _unpack_prepared_columns(extra_cols)
 
         if not refdes:
             continue
@@ -212,7 +347,6 @@ def validate_prepared_excel_against_bom(
     for er in excel_rows:
         ref = er["refdes"].strip()
         ref_upper = ref.upper()
-        sheet_name = er["sheet"]
         side = er["side"]
         row_num = er["row_idx"]
 
@@ -222,21 +356,14 @@ def validate_prepared_excel_against_bom(
         if "_" in ref_upper:
             pfx = ref_upper.split("_", 1)[0]
             tested_prefixes.add(pfx)
+            if pfx.endswith(("L", "R")) and len(pfx) >= 3:
+                tested_prefixes.add(pfx[:-1])
         else:
             tested_prefixes.add("")
 
-        # Lookup in Canias BOM
-        canias_codes = refdes_to_codes.get(ref_upper)
-        matched_key = ref_upper
-        if not canias_codes:
-            # Check without prefix
-            m = re.match(r"^[A-Za-z0-9]+_(.+)$", ref_upper)
-            if m:
-                stripped_ref = m.group(1).upper()
-                canias_codes = refdes_to_codes.get(stripped_ref)
-                if canias_codes:
-                    matched_key = stripped_ref
-                    seen_excel_refs.add(stripped_ref)
+        # Lookup in Canias BOM with L/R and multi-board equivalence
+        canias_codes, matched_keys = lookup_refdes_in_bom(ref_upper, refdes_to_codes, item_by_code)
+        seen_excel_refs.update(matched_keys)
 
         # 1. If not found in BOM at all
         if not canias_codes:
@@ -254,8 +381,14 @@ def validate_prepared_excel_against_bom(
             summary.extra_in_excel_count += 1
             continue
 
-        canias_code = canias_codes[0]
-        bom_item = item_by_code.get(canias_code)
+        code_in_file = er["code"].strip().upper()
+        matched_code = canias_codes[0]
+        for c_cand in canias_codes:
+            if c_cand.strip().upper() == code_in_file:
+                matched_code = c_cand
+                break
+
+        bom_item = item_by_code.get(matched_code) or item_by_code.get(canias_codes[0])
         if not bom_item:
             continue
 
@@ -279,17 +412,16 @@ def validate_prepared_excel_against_bom(
             continue
 
         # 3. Check Canias Stock Code (Ü.A Eleman Num.)
-        code_in_file = er["code"].strip().upper()
         expected_code = bom_item.canias_code.strip().upper()
 
-        if code_in_file and code_in_file != expected_code:
+        if not code_in_file or code_in_file != expected_code:
             summary.differences.append(ValidationDifference(
                 refdes=ref,
                 side=side,
                 status="HATA",
                 category="CANIAS_KODU",
-                detail="Canias Stok Kodu (Ü.A Eleman Num.) güncel BOM ile uyuşmuyor (Malzeme kodu sonradan revize edilmiş).",
-                excel_value=er["code"],
+                detail="Canias Stok Kodu (Ü.A Eleman Num.) güncel BOM ile uyuşmuyor (Malzeme kodu sonradan revize edilmiş veya eksik).",
+                excel_value=er["code"] or "(Boş)",
                 bom_value=bom_item.canias_code,
                 excel_row=row_num,
                 suggested_fix={"canias_code": bom_item.canias_code}

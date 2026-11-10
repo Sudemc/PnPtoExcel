@@ -9,6 +9,8 @@ Verifies:
 - Exact Layer / Side placement (Top vs Bottom).
 - Identifies legitimately excluded non-SMD components (TH, Krem Lehim, Dummy) if BOM is provided.
 """
+import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set, Any
 import openpyxl
@@ -16,7 +18,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from .models import BomItem
-from .bom_parser import load_canias_bom, extract_erp_prefixes, resolve_pnp_file_prefix
+from .bom_parser import load_canias_bom, extract_erp_prefixes, resolve_pnp_file_prefix, lookup_refdes_in_bom
 from .pnp_parser import load_pnp_file, format_coord_3dec, clean_angle
 from .validator_engine import read_prepared_files
 from .matcher_pipeline import natural_sort_key
@@ -60,64 +62,143 @@ def verify_pnp_against_prepared(
     """
     Executes deep verification between Customer P&P files and Prepared .AOI / Excel files.
     """
-    # 1. Optionally parse BOM to identify non-SMD components
-    non_smd_ref_map: Dict[str, str] = {}
-    erp_prefixes: Set[str] = set()
-    erp_refs_by_pfx: Dict[str, Set[str]] = {}
+    # 1. Read Prepared Excel / AOI rows first so their prefixes are known even without a BOM
+    prepared_rows = read_prepared_files(prepared_paths)
 
+    non_smd_ref_map: Dict[str, str] = {}
+    smd_bom_refs: Set[str] = set()
+    refdes_to_codes: Dict[str, List[str]] = {}
+    item_by_code: Dict[str, BomItem] = {}
+    erp_prefixes: Set[str] = set()
+    erp_refs_by_pfx: Dict[str, Set[str]] = defaultdict(set)
+    has_bom = False
+
+    # Extract prefixes present in prepared_rows
+    for pr in prepared_rows:
+        ref_u = pr["refdes"].strip().upper()
+        if "_" in ref_u:
+            pfx, base = ref_u.split("_", 1)
+            if 2 <= len(pfx) <= 10 and re.match(r"^[A-Z]+\d+", base):
+                erp_refs_by_pfx[pfx].add(base)
+    for pfx, bases in list(erp_refs_by_pfx.items()):
+        if len(bases) >= 2:
+            erp_prefixes.add(pfx)
+
+    # 2. Optionally parse BOM to identify SMD vs non-SMD / DNP components and board prefixes
     if bom_path:
         try:
-            bom_items, _, _ = load_canias_bom(bom_path)
-            erp_refs_by_pfx = extract_erp_prefixes(bom_items)
-            erp_prefixes = set(erp_refs_by_pfx.keys())
+            bom_items, refdes_to_codes, item_by_code = load_canias_bom(bom_path)
+            has_bom = True
+            bom_refs_by_pfx = extract_erp_prefixes(bom_items)
+            for pfx, bases in bom_refs_by_pfx.items():
+                erp_prefixes.add(pfx)
+                erp_refs_by_pfx[pfx].update(bases)
             for item in bom_items:
-                if not item.is_smd:
+                if item.is_smd:
+                    for r in item.designator_list:
+                        r_u = r.upper()
+                        smd_bom_refs.add(r_u)
+                        if "_" in r_u:
+                            p_u, b_u = r_u.split("_", 1)
+                            if p_u.endswith(("L", "R")) and len(p_u) >= 3:
+                                smd_bom_refs.add(f"{p_u[:-1]}_{b_u}")
+                else:
                     for r in item.designator_list:
                         non_smd_ref_map[r.upper()] = item.skip_reason or "SMD Değil"
         except Exception:
             pass
 
-    # 2. Parse Customer P&P rows
+    # 3. Parse Customer P&P rows (resolving board prefix with raw designators)
     customer_rows = []
     cust_filenames = [p for p in customer_pnp_paths]
 
     for p in customer_pnp_paths:
-        pfx = resolve_pnp_file_prefix(p, set(), erp_prefixes, erp_refs_by_pfx, all_filenames=cust_filenames)
-        p_rows = load_pnp_file(p, prefix=pfx)
-        customer_rows.extend(p_rows)
-
-    # 3. Parse Prepared Excel / AOI rows
-    prepared_rows = read_prepared_files(prepared_paths)
+        raw_p_rows = load_pnp_file(p, prefix="")
+        pnp_refs = {r.raw_designator for r in raw_p_rows}
+        pfx = resolve_pnp_file_prefix(p, pnp_refs, erp_prefixes, erp_refs_by_pfx, all_filenames=cust_filenames)
+        if pfx:
+            clean_pfx = pfx.strip().rstrip("_")
+            for r in raw_p_rows:
+                r.prefix = pfx
+                if not r.raw_designator.upper().startswith(f"{clean_pfx.upper()}_"):
+                    r.designator = f"{clean_pfx}_{r.raw_designator}"
+        customer_rows.extend(raw_p_rows)
 
     summary = PnpVerificationSummary(
         total_customer_components=len(customer_rows),
         total_prepared_components=len(prepared_rows)
     )
 
-    # Build lookup map for prepared components
-    # Keys stored both as exact RefDes and uppercase, with and without prefix
-    prep_by_ref: Dict[str, Dict[str, Any]] = {}
-    for pr in prepared_rows:
+    # 4. Build multi-instance lookup map for prepared components (supporting L/R duplicate boards)
+    prep_by_ref: Dict[str, List[Tuple[int, Dict[str, Any]]]] = defaultdict(list)
+    prep_unprefixed: Dict[str, List[Tuple[int, Dict[str, Any]]]] = defaultdict(list)
+    for idx, pr in enumerate(prepared_rows):
         ref_u = pr["refdes"].strip().upper()
-        prep_by_ref[ref_u] = pr
-        # If prefixed (ST1_R31), also map base (R31) if not already mapped
+        prep_by_ref[ref_u].append((idx, pr))
         if "_" in ref_u:
-            base_r = ref_u.split("_", 1)[1]
-            if base_r not in prep_by_ref:
-                prep_by_ref[base_r] = pr
+            pfx_u, base_r = ref_u.split("_", 1)
+            if pfx_u.endswith(("L", "R")) and len(pfx_u) >= 3:
+                prep_by_ref[f"{pfx_u[:-1]}_{base_r}"].append((idx, pr))
+        else:
+            prep_unprefixed[ref_u].append((idx, pr))
 
-    seen_prep_refs: Set[str] = set()
+    used_prep_indices: Set[int] = set()
+    matched_pairs: List[Tuple[Any, int, Dict[str, Any]]] = []
 
     for crow in customer_rows:
         c_ref = crow.designator.strip().upper()
         c_raw_ref = crow.raw_designator.strip().upper()
 
-        # Check if non-SMD in BOM
+        # Check if non-SMD or absent (DNP) in BOM
         is_known_non_smd = (c_ref in non_smd_ref_map) or (c_raw_ref in non_smd_ref_map)
         skip_reason = non_smd_ref_map.get(c_ref) or non_smd_ref_map.get(c_raw_ref)
 
-        # Lookup in prepared rows
-        matched_prep = prep_by_ref.get(c_ref) or prep_by_ref.get(c_raw_ref)
+        if not is_known_non_smd and has_bom:
+            codes, _ = lookup_refdes_in_bom(c_ref, refdes_to_codes, item_by_code)
+            if not codes:
+                is_known_non_smd = True
+                skip_reason = "Canias BOM'da Yok / DNP (Dizgisiz)"
+            else:
+                b_item = item_by_code.get(codes[0])
+                if b_item and not b_item.is_smd:
+                    is_known_non_smd = True
+                    skip_reason = b_item.skip_reason or "SMD Değil"
+
+        # Gather candidate prepared rows for this customer component (strictly same board)
+        candidates = list(prep_by_ref.get(c_ref, []))
+        if not candidates and "_" in c_ref:
+            pfx_u, base_u = c_ref.split("_", 1)
+            if pfx_u.endswith(("L", "R")) and len(pfx_u) >= 3:
+                candidates = list(prep_by_ref.get(f"{pfx_u[:-1]}_{base_u}", []))
+            else:
+                candidates = list(prep_by_ref.get(f"{pfx_u}L_{base_u}", [])) + list(prep_by_ref.get(f"{pfx_u}R_{base_u}", []))
+        if not candidates:
+            candidates = list(prep_unprefixed.get(c_raw_ref, []))
+
+        matched_prep = None
+        matched_idx = None
+        if candidates:
+            unused = [(i, pr) for i, pr in candidates if i not in used_prep_indices]
+            if unused:
+                try:
+                    cx_f = float(format_coord_3dec(crow.center_x))
+                    cy_f = float(format_coord_3dec(crow.center_y))
+                except ValueError:
+                    cx_f, cy_f = 0.0, 0.0
+
+                def _cand_sort_key(item: Tuple[int, Dict[str, Any]]):
+                    _, pr = item
+                    side_pen = 0 if pr["side"] == crow.layer else 1
+                    try:
+                        px_f = float(format_coord_3dec(pr["x"]))
+                        py_f = float(format_coord_3dec(pr["y"]))
+                        dist = (px_f - cx_f) ** 2 + (py_f - cy_f) ** 2
+                    except ValueError:
+                        dist = 1e9
+                    return (side_pen, dist)
+
+                unused.sort(key=_cand_sort_key)
+                matched_idx, matched_prep = unused[0]
 
         if not matched_prep:
             if is_known_non_smd:
@@ -148,11 +229,47 @@ def verify_pnp_against_prepared(
                 ))
             continue
 
-        prep_ref_key = matched_prep["refdes"].strip().upper()
-        seen_prep_refs.add(prep_ref_key)
-        seen_prep_refs.add(prep_ref_key.split("_", 1)[1] if "_" in prep_ref_key else prep_ref_key)
+        used_prep_indices.add(matched_idx)
+        matched_pairs.append((crow, matched_idx, matched_prep))
 
-        # Compare Coordinates, Angle, and Layer
+    # 5. Detect board/side constant Gerber panel offsets (when >= 5 parts and >= 80% share exact same non-zero delta)
+    group_dx: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    group_dy: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    for crow, _, matched_prep in matched_pairs:
+        grp_key = (crow.prefix or "", crow.layer)
+        try:
+            dx = round(float(format_coord_3dec(matched_prep["x"])) - float(format_coord_3dec(crow.center_x)), 3)
+            dy = round(float(format_coord_3dec(matched_prep["y"])) - float(format_coord_3dec(crow.center_y)), 3)
+            group_dx[grp_key].append(dx)
+            group_dy[grp_key].append(dy)
+        except ValueError:
+            pass
+
+    panel_offsets: Dict[Tuple[str, str], Tuple[float, float]] = {}
+    for grp_key, dxs in group_dx.items():
+        dys = group_dy[grp_key]
+        if len(dxs) >= 5:
+            top_dx, count_dx = Counter(dxs).most_common(1)[0]
+            top_dy, count_dy = Counter(dys).most_common(1)[0]
+            eff_dx = top_dx if (count_dx / len(dxs)) >= 0.80 else 0.0
+            eff_dy = top_dy if (count_dy / len(dys)) >= 0.80 else 0.0
+            if eff_dx != 0.0 or eff_dy != 0.0:
+                panel_offsets[grp_key] = (eff_dx, eff_dy)
+                board_lbl = grp_key[0] or "Ana Kart"
+                summary.differences.append(PnpVerificationDifference(
+                    refdes=f"{board_lbl} ({grp_key[1]})",
+                    side=grp_key[1],
+                    status="BILGI",
+                    category="PANEL_OFFSET",
+                    detail=f"Sabit Gerber/Panel koordinat ofseti tespit edildi: dX={eff_dx:+.3f} mm, dY={eff_dy:+.3f} mm ({len(dxs)} komponent).",
+                    customer_value="Orijinal CAD Orjini",
+                    prepared_value=f"dX={eff_dx:+.3f}, dY={eff_dy:+.3f} mm",
+                    customer_file="",
+                    prepared_file=""
+                ))
+
+    # 6. Compare Coordinates, Angle, and Layer for each matched pair
+    for crow, _, matched_prep in matched_pairs:
         has_coord_mismatch = False
         has_angle_mismatch = False
         has_layer_mismatch = False
@@ -168,8 +285,14 @@ def verify_pnp_against_prepared(
         cust_side = crow.layer
         prep_side = matched_prep["side"]
 
+        grp_key = (crow.prefix or "", cust_side)
+        off_x, off_y = panel_offsets.get(grp_key, (0.0, 0.0))
+
+        expected_x = format_coord_3dec(str(float(cust_x) + off_x)) if off_x != 0.0 else cust_x
+        expected_y = format_coord_3dec(str(float(cust_y) + off_y)) if off_y != 0.0 else cust_y
+
         # Check X
-        if cust_x != prep_x:
+        if expected_x != prep_x:
             has_coord_mismatch = True
             summary.coord_error_count += 1
             summary.differences.append(PnpVerificationDifference(
@@ -185,7 +308,7 @@ def verify_pnp_against_prepared(
             ))
 
         # Check Y
-        if cust_y != prep_y:
+        if expected_y != prep_y:
             has_coord_mismatch = True
             summary.coord_error_count += 1
             summary.differences.append(PnpVerificationDifference(
@@ -235,11 +358,9 @@ def verify_pnp_against_prepared(
         if not has_coord_mismatch and not has_angle_mismatch and not has_layer_mismatch:
             summary.match_count += 1
 
-    # Check for components present in prepared file but NOT in customer P&P
-    for pr in prepared_rows:
-        pr_ref = pr["refdes"].strip().upper()
-        base_pr_ref = pr_ref.split("_", 1)[1] if "_" in pr_ref else pr_ref
-        if pr_ref not in seen_prep_refs and base_pr_ref not in seen_prep_refs:
+    # 7. Check for components present in prepared file but NOT in customer P&P
+    for idx, pr in enumerate(prepared_rows):
+        if idx not in used_prep_indices:
             summary.extra_in_prepared_count += 1
             summary.differences.append(PnpVerificationDifference(
                 refdes=pr["refdes"],

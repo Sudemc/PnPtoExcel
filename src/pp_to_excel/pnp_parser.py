@@ -244,9 +244,17 @@ def find_column_indices(header_tokens: List[str]) -> Tuple[Dict[str, int], Optio
     return col_map, detected_unit
 
 
+def _cell_str(val: Any) -> str:
+    """Safely converts an Excel cell value to string without turning numeric 0 into empty string."""
+    if val is None:
+        return ""
+    return str(val).strip()
+
+
 def parse_pnp_xlsx(file_path: str, prefix: str = "", unit_override: Optional[str] = None) -> List[PnPRow]:
     """
     Parses an Excel (.xlsx) Pick & Place file.
+    Supports both headed CAD Pick & Place sheets and headerless AOI-style Excel sheets.
     """
     wb = openpyxl.load_workbook(file_path, data_only=True)
     
@@ -261,7 +269,7 @@ def parse_pnp_xlsx(file_path: str, prefix: str = "", unit_override: Optional[str
         for sname in wb.sheetnames:
             s = wb[sname]
             for r in range(1, min(s.max_row + 1, 20)):
-                row_vals = [str(s.cell(r, c).value or "").lower() for c in range(1, s.max_column + 1)]
+                row_vals = [_cell_str(s.cell(r, c).value).lower() for c in range(1, s.max_column + 1)]
                 if any("designator" in v or "refdes" in v for v in row_vals):
                     target_sheet = s
                     break
@@ -274,9 +282,10 @@ def parse_pnp_xlsx(file_path: str, prefix: str = "", unit_override: Optional[str
     header_row_idx = None
     col_map = {}
     detected_unit = None
+    is_headerless = False
 
     for r in range(1, min(target_sheet.max_row + 1, 30)):
-        row_vals = [str(target_sheet.cell(r, c).value or "").strip() for c in range(1, target_sheet.max_column + 1)]
+        row_vals = [_cell_str(target_sheet.cell(r, c).value) for c in range(1, target_sheet.max_column + 1)]
         cm, u = find_column_indices(row_vals)
         if "designator" in cm and "x" in cm and "y" in cm:
             header_row_idx = r
@@ -285,19 +294,46 @@ def parse_pnp_xlsx(file_path: str, prefix: str = "", unit_override: Optional[str
             break
 
     if not header_row_idx or "designator" not in col_map or "x" not in col_map or "y" not in col_map:
+        # Fallback: check if any sheet in workbook is a headerless P&P / AOI table (RefDes | X | Y | Rot | [Layer])
+        for sname in ([target_sheet.title] + [sn for sn in wb.sheetnames if sn != target_sheet.title]):
+            s = wb[sname]
+            for r in range(1, min(s.max_row + 1, 6)):
+                c1 = _cell_str(s.cell(r, 1).value)
+                c2 = _cell_str(s.cell(r, 2).value)
+                c3 = _cell_str(s.cell(r, 3).value)
+                c4 = _cell_str(s.cell(r, 4).value)
+                c5 = _cell_str(s.cell(r, 5).value)
+                if is_valid_refdes_row(c1, c2, c3):
+                    target_sheet = s
+                    header_row_idx = r - 1
+                    col_map = {"designator": 0, "x": 1, "y": 2}
+                    if c4 and is_valid_coordinate(c4):
+                        col_map["rotation"] = 3
+                    if c5 and c5.upper() in ("T", "B", "TOP", "BOT", "BOTTOM", "TOPLAYER", "BOTTOMLAYER"):
+                        col_map["layer"] = 4
+                    is_headerless = True
+                    break
+            if is_headerless:
+                break
+
+    if header_row_idx is None or "designator" not in col_map or "x" not in col_map or "y" not in col_map:
         raise ValueError(f"Pick & Place dosyasında gerekli sütunlar (Designator, X, Y) tespit edilemedi: {file_path}")
 
     raw_candidates = []
     for r in range(header_row_idx + 1, target_sheet.max_row + 1):
-        raw_designator = str(target_sheet.cell(r, col_map["designator"] + 1).value or "").strip()
-        raw_x = str(target_sheet.cell(r, col_map["x"] + 1).value or "").strip()
-        raw_y = str(target_sheet.cell(r, col_map["y"] + 1).value or "").strip()
+        raw_designator = _cell_str(target_sheet.cell(r, col_map["designator"] + 1).value)
+        raw_x = _cell_str(target_sheet.cell(r, col_map["x"] + 1).value)
+        raw_y = _cell_str(target_sheet.cell(r, col_map["y"] + 1).value)
 
         rot_idx = col_map.get("rotation")
-        raw_rot = str(target_sheet.cell(r, rot_idx + 1).value or "").strip() if rot_idx is not None else "0"
+        raw_rot = _cell_str(target_sheet.cell(r, rot_idx + 1).value) if rot_idx is not None else "0"
+        if not raw_rot:
+            raw_rot = "0"
 
         layer_idx = col_map.get("layer")
-        raw_layer = str(target_sheet.cell(r, layer_idx + 1).value or "").strip() if layer_idx is not None else "Top"
+        raw_layer = _cell_str(target_sheet.cell(r, layer_idx + 1).value) if layer_idx is not None else "Top"
+        if not raw_layer:
+            raw_layer = "Top"
 
         if not is_valid_refdes_row(raw_designator, raw_x, raw_y):
             continue
@@ -305,12 +341,15 @@ def parse_pnp_xlsx(file_path: str, prefix: str = "", unit_override: Optional[str
         raw_candidates.append((r, raw_designator, raw_x, raw_y, raw_rot, raw_layer))
 
     effective_unit = unit_override or detected_unit
-    if not effective_unit:
+    if not effective_unit and not is_headerless:
         effective_unit = _infer_unit_from_coordinates([(rx, ry) for _, _, rx, ry, _, _ in raw_candidates])
 
     rows: List[PnPRow] = []
     for r, raw_designator, raw_x, raw_y, raw_rot, raw_layer in raw_candidates:
-        if effective_unit == "mil" and "mm" not in raw_x.lower():
+        if is_headerless and not unit_override:
+            cx = repair_turkish_excel_coord(raw_x)
+            cy = repair_turkish_excel_coord(raw_y)
+        elif effective_unit == "mil" and "mm" not in raw_x.lower():
             cx = convert_mil_to_mm(raw_x)
             cy = convert_mil_to_mm(raw_y)
         else:

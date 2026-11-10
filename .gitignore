@@ -22,8 +22,11 @@ test_*.AOI
 *.csv
 *.AOI
 *.GBR
+*.GBX
 *.jpeg
 *.pdf
 Pick Place*
 2026-10-14*
 VAL8_V2_UC2_V8.1/
+UPPER/
+son gelenlerden/

@@ -710,26 +710,46 @@
         if (stems.length === 2 && stems[0] === stems[1]) return '';
       }
 
-      // CamelCase & Acronym tokenization
       const base = filename.replace(/\.[^.]+$/, '');
-      const cleaned = base.replace(/\b(?:PICK|PLACE|P&P|PCB|ASSY|BOARD|SAMPLE|LOWER|UPPER|MAN|LAMP|HW\d+|SW\d+|V\d+)\b/gi, '').trim();
-      const spaced = cleaned.replace(/(FOG|STOP|TAIL|TURN|REV|MAIN|LAMP|UPPER|LOWER|REAR|FRONT|LEFT|RIGHT)/gi, ' $1 ');
-      const tokens = spaced.split(/[\s_\-]+/).filter(Boolean);
+      const rawTokens = base.split(/[_\-\s]+/).filter(Boolean);
+      const rawTokensUpper = rawTokens.map(t => t.toUpperCase());
 
-      if (tokens.length) {
-        const acro = tokens.map(t => /^\d+$/.test(t) ? t : t[0]).filter(t => !['LEFT', 'RIGHT', 'LH', 'RH'].includes(t.toUpperCase())).join('').toUpperCase();
+      // Direct exact match of any token against knownPfxs
+      for (const tokUp of rawTokensUpper) {
+        if (knownPfxs.includes(tokUp)) return tokUp;
+      }
+
+      const hasL = knownPfxs.some(p => p.endsWith('L'));
+      const hasR = knownPfxs.some(p => p.endsWith('R'));
+      let fileSide = null;
+      if (hasL && rawTokensUpper.some(t => ['LEFT', 'LH', 'SOL', 'L'].includes(t))) {
+        fileSide = 'L';
+      } else if (hasR && rawTokensUpper.some(t => ['RIGHT', 'RH', 'SAG', 'SAĞ', 'R'].includes(t))) {
+        fileSide = 'R';
+      }
+
+      for (const tok of rawTokens) {
+        const spaced = tok.replace(/(FOG|STOP|TAIL|TURN|REV|MAIN|LAMP|UPPER|LOWER|REAR|FRONT|LEFT|RIGHT)/gi, ' $1 ');
+        const subTokens = spaced.split(/[\s_\-]+/).filter(Boolean).map(t => t.toUpperCase());
+        const acro = subTokens
+          .filter(t => !['LEFT', 'RIGHT', 'LH', 'RH', 'LOWER', 'UPPER', 'FRONT', 'REAR', 'LAMP', 'HW', 'SW', 'PCB', 'P&P'].includes(t))
+          .map(t => /^\d+$/.test(t) ? t : t[0])
+          .join('');
+        if (!acro) continue;
+
+        if (fileSide && knownPfxs.includes(acro + fileSide)) {
+          return acro + fileSide;
+        }
         if (knownPfxs.includes(acro)) return acro;
+        if (knownPfxs.includes(acro + 'L')) return acro + 'L';
+        if (knownPfxs.includes(acro + 'R')) return acro + 'R';
         for (const p of knownPfxs) {
           if (acro.startsWith(p) || p === acro) return p;
-        }
-        for (const tok of tokens) {
-          const tokUp = tok.toUpperCase();
-          if (knownPfxs.includes(tokUp)) return tokUp;
         }
       }
 
       for (const pfx of knownPfxs) {
-        if (new RegExp(`(?:^|[_\-\\s])${pfx}(?:$|[_\-\\s])`, 'i').test(base)) return pfx;
+        if (new RegExp(`(?:^|[_\\-\\s])${pfx}(?:$|[_\\-\\s])`, 'i').test(base)) return pfx;
       }
 
       return '';

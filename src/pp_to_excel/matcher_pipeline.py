@@ -9,9 +9,10 @@ Merges Pick & Place components with Canias ERP BOM records:
 - Tracks statistics (matched, unmatched, skipped non-SMD, missing in P&P).
 """
 import re
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Set
 from dataclasses import dataclass, field
 from .models import PnPRow, BomItem, MatchedRow
+from .bom_parser import lookup_refdes_in_bom
 
 
 def natural_sort_key(s: str):
@@ -50,22 +51,21 @@ def run_matching_pipeline(
     bottom_rows: List[MatchedRow] = []
     report = PipelineReport(total_pnp_rows=len(pnp_rows))
 
-    matched_bom_refdes = set()
+    matched_bom_refdes: Set[str] = set()
+    tested_prefixes: Set[str] = set()
 
     for pnp in pnp_rows:
         ref_clean = pnp.designator.strip().upper()
-        
-        # Check if RefDes exists in Canias BOM
-        matched_key = ref_clean
-        canias_codes = refdes_to_codes.get(ref_clean)
-        if not canias_codes:
-            # Try without prefix if prefixed
-            m = re.match(r"^[A-Za-z0-9]+_(.+)$", ref_clean)
-            if m:
-                stripped_key = m.group(1).upper()
-                canias_codes = refdes_to_codes.get(stripped_key)
-                if canias_codes:
-                    matched_key = stripped_key
+        if "_" in ref_clean:
+            pfx = ref_clean.split("_", 1)[0]
+            tested_prefixes.add(pfx)
+            if pfx.endswith(("L", "R")) and len(pfx) >= 3:
+                tested_prefixes.add(pfx[:-1])
+        else:
+            tested_prefixes.add("")
+
+        # Check if RefDes exists in Canias BOM (with L/R and multi-board equivalence)
+        canias_codes, matched_keys = lookup_refdes_in_bom(ref_clean, refdes_to_codes, item_by_code)
 
         if not canias_codes:
             report.unmatched_pnp_count += 1
@@ -89,8 +89,7 @@ def run_matching_pipeline(
         if not spec:
             continue
 
-        matched_bom_refdes.add(ref_clean)
-        matched_bom_refdes.add(matched_key)
+        matched_bom_refdes.update(matched_keys)
 
         # Build 10-column matched row
         # Sütun E daima sabit olarak "T" yazılır!
@@ -123,12 +122,15 @@ def run_matching_pipeline(
     report.top_placed_count = len(top_rows)
     report.bottom_placed_count = len(bottom_rows)
 
-    # Check which SMD BOM designators were not present in P&P
+    # Check which SMD BOM designators were not present in P&P (scoped to uploaded board prefixes)
     all_smd_bom_refs = set()
     for item in bom_items:
         if item.is_smd:
             for r in item.designator_list:
-                all_smd_bom_refs.add(r.upper())
+                r_up = r.upper()
+                pfx = r_up.split("_", 1)[0] if "_" in r_up else ""
+                if not tested_prefixes or pfx in tested_prefixes or (not pfx and "" in tested_prefixes):
+                    all_smd_bom_refs.add(r_up)
 
     missing_in_pnp = sorted(all_smd_bom_refs - matched_bom_refdes, key=natural_sort_key)
     report.bom_missing_in_pnp_count = len(missing_in_pnp)
